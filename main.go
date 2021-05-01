@@ -1,7 +1,10 @@
 package main
 
 import (
+	"bytes"
+	"crypto/md5"
 	"crypto/rand"
+	"crypto/sha1"
 	"flag"
 	"fmt"
 	"os"
@@ -108,8 +111,23 @@ func main() {
 			}
 		}
 
+		// check integrity if hashes were provided in metadata
+		fileRaw := resultBuf[usedBytes : usedBytes+file.Length]
+		if file.SHA1Hash != "" {
+			hash := sha1.Sum(fileRaw)
+			if !bytes.Equal(hash[:], []byte(file.SHA1Hash)) {
+				panic(fmt.Sprintf("%q failed SHA-1 hash comparison", file.FullPath))
+			}
+		}
+		if file.MD5Hash != "" {
+			hash := md5.Sum(fileRaw)
+			if !bytes.Equal(hash[:], []byte(file.MD5Hash)) {
+				panic(fmt.Sprintf("%q failed MD5 hash comparison", file.FullPath))
+			}
+		}
+
 		// write to the file
-		err = os.WriteFile(outPath, resultBuf[usedBytes:usedBytes+file.Length], os.ModePerm)
+		err = os.WriteFile(outPath, fileRaw, os.ModePerm)
 		usedBytes += file.Length
 		if err != nil {
 			panic("writing to file: " + err.Error())

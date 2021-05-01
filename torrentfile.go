@@ -31,10 +31,10 @@ type TorrentFile struct {
 }
 
 type File struct {
-	Length   int      // length in bytes
-	FullPath string   // download path
-	SHA1Hash [20]byte // optional for final validation
-	MD5Hash  [20]byte // optional for final validation
+	Length   int    // length in bytes
+	FullPath string // download path
+	SHA1Hash string // optional for final validation
+	MD5Hash  string // optional for final validation
 }
 
 // ParseTorrentFile parses a raw .torrent file into a structure that aligns
@@ -142,13 +142,12 @@ func toTorrentFile(btor bencodeTorrent, info bencodeInfo) (TorrentFile, error) {
 	} else {
 		for _, f := range info.Files {
 			subPaths := append([]string{info.Name}, f.Path...)
-			file := File{
+			files = append(files, File{
 				Length:   f.Length,
 				FullPath: filepath.Join(subPaths...),
-			}
-			copy(file.SHA1Hash[:], []byte(f.SHA1Hash))
-			copy(file.MD5Hash[:], []byte(f.MD5Hash))
-			files = append(files, file)
+				SHA1Hash: f.SHA1Hash,
+				MD5Hash:  f.MD5Hash,
+			})
 			totalLength += f.Length
 		}
 	}
