@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"os"
+	"path/filepath"
 	"strconv"
 
 	"github.com/zeebo/bencode"
@@ -21,86 +22,47 @@ import (
 // The 20 byte SHA1 hashes are formatted into a slice of 20-byte arrays for easy
 // comparison with pieces downloaded from a peer
 type TorrentFile struct {
-	Announce string
-	// SHA-1 hash of entire torrent file's Info field
-	InfoHash [20]byte
-	// individual SHA-1 hashes of each file piece
-	PieceHashes [][20]byte
-	// number of bytes of each file piece
-	PieceLength int
-	Length      int
-	Name        string
+	Announce    string     // a url to get peers from
+	InfoHash    [20]byte   // SHA-1 hash of entire torrent file's Info field
+	PieceHashes [][20]byte // individual SHA-1 hashes of each file piece
+	PieceLength int        // number of bytes of each piece
+	TotalLength int        // Calculated as the sum of all files
+	Files       []File     // in the 1 file case, this will only have one element
 }
 
-// ParseTorrentFile parses a torrent file via bencode.Unmarshal
+type File struct {
+	Length   int      // length in bytes
+	FullPath string   // download path
+	SHA1Hash [20]byte // optional for final validation
+	MD5Hash  [20]byte // optional for final validation
+}
+
+// ParseTorrentFile parses a raw .torrent file into a structure that aligns
+// with the peer to peer download process.
 func ParseTorrentFile(filename string) (TorrentFile, error) {
 	f, err := os.Open(os.ExpandEnv(filename))
 	if err != nil {
 		return TorrentFile{}, err
 	}
 
-	var bto bencodeTorrent
-	err = bencode.NewDecoder(f).Decode(&bto)
+	var btor bencodeTorrent
+	err = bencode.NewDecoder(f).Decode(&btor)
 	if err != nil {
-		return TorrentFile{}, fmt.Errorf("unmarshalling file %w", err)
+		return TorrentFile{}, fmt.Errorf("unmarshalling file: %w", err)
 	}
 
-	tf, err := bto.toTorrentFile()
+	var info bencodeInfo
+	err = bencode.DecodeBytes(btor.Info, &info)
 	if err != nil {
-		return TorrentFile{}, fmt.Errorf("parsing file contents %w", err)
+		return TorrentFile{}, fmt.Errorf("umarshalling info dict: %w", err)
+	}
+
+	tf, err := toTorrentFile(btor, info)
+	if err != nil {
+		return TorrentFile{}, fmt.Errorf("parsing file contents: %w", err)
 	}
 
 	return tf, nil
-}
-
-// serialization struct the represents the structure of a .torrent file
-// it is not immediately usable, so it can be converted to a TorrentFile struct
-type bencodeTorrent struct {
-	Announce string      `bencode:"announce"` // URL of tracker server to get peers from
-	Info     bencodeInfo `bencode:"info"`
-}
-
-// this is defined as a separate struct for future expansion of the
-// bencodeTorrent.Info field into bencode.RawMessage type for hashing unknown/
-// unfamiliar shaped info dictionaries
-//
-// Only Length or Files will be present, the other will present as its
-// corresponding Go zero-value
-type bencodeInfo struct {
-	Pieces      string `bencode:"pieces"`       // binary blob of all SHA1 hash of each piece
-	PieceLength int    `bencode:"piece length"` // length in bytes of each piece
-	Name        string `bencode:"name"`         // Name of file (or folder if there are multiple files)
-	Length      int    `bencode:"length"`       // total length of file (in single file case)
-}
-
-func (b bencodeTorrent) toTorrentFile() (TorrentFile, error) {
-	// get info hash by bencode mashalling "info" field & SHA-1 hashing it
-	infoB, err := bencode.EncodeBytes(b.Info)
-	if err != nil {
-		return TorrentFile{}, err
-	}
-	infoHash := sha1.Sum(infoB)
-
-	const hashLen = 20 // length of a SHA-1 hash
-
-	// ensure evenly divisible by 20
-	if len(b.Info.Pieces)%hashLen != 0 {
-		return TorrentFile{}, errors.New("invalid length for info pieces")
-	}
-	pieceHashes := make([][20]byte, len(b.Info.Pieces)/hashLen)
-	for i := 0; i < len(pieceHashes); i++ {
-		piece := b.Info.Pieces[i*hashLen : (i+1)*hashLen]
-		copy(pieceHashes[i][:], piece)
-	}
-
-	return TorrentFile{
-		Announce:    b.Announce,
-		InfoHash:    infoHash,
-		PieceHashes: pieceHashes,
-		PieceLength: b.Info.PieceLength,
-		Length:      b.Info.Length,
-		Name:        b.Info.Name,
-	}, nil
 }
 
 func (t TorrentFile) BuildTrackerURL(peerID [20]byte, port int) (string, error) {
@@ -109,20 +71,94 @@ func (t TorrentFile) BuildTrackerURL(peerID [20]byte, port int) (string, error) 
 		return "", err
 	}
 	v := url.Values{}
-	// hash of file we're downloading
 	v.Add("info_hash", string(t.InfoHash[:]))
-	// peer_id identifies ME, we're using some random. Real bittorrent
-	// clients would identify client software and version
+	// my peer_id (just random). Real bittorrent clients would identify software and version
 	v.Add("peer_id", string(peerID[:]))
-	// port maybe should be a uint16?
 	v.Add("port", strconv.Itoa(port))
 	v.Add("uploaded", "0")
 	v.Add("downloaded", "0")
-	v.Add("compact", "1")
-	v.Add("left", strconv.Itoa(t.Length))
+	v.Add("compact", "1") // BEP0023: compact peer list
+	v.Add("left", strconv.Itoa(t.TotalLength))
 
 	// set url query params
 	u.RawQuery = v.Encode()
 
 	return u.String(), nil
+}
+
+// serialization struct the represents the structure of a .torrent file
+// it is not immediately usable, so it can be converted to a TorrentFile struct
+type bencodeTorrent struct {
+	// URL of tracker server to get peers from
+	Announce string `bencode:"announce"`
+	// Info is parsed as a RawMessage to ensure that the final info_hash is
+	// correct even in the case of the info dictionary being an unexpected shape
+	Info bencode.RawMessage `bencode:"info"`
+}
+
+// Only Length OR Files will be present per BEP0003
+// spec: http://bittorrent.org/beps/bep_0003.html#info-dictionary
+type bencodeInfo struct {
+	Pieces      string `bencode:"pieces"`       // binary blob of all SHA1 hash of each piece
+	PieceLength int    `bencode:"piece length"` // length in bytes of each piece
+	Name        string `bencode:"name"`         // Name of file (or folder if there are multiple files)
+	Length      int    `bencode:"length"`       // total length of file (in single file case)
+	Files       []struct {
+		Length   int      `bencode:"length"` // length of this file
+		Path     []string `bencode:"path"`   // list of subdirectories, last element is file name
+		SHA1Hash string   `bencode:"sha1"`   // optional, to validate this file
+		MD5Hash  string   `bencode:"md5"`    // optional, to validate this file
+	} `bencode:"files"`
+}
+
+func toTorrentFile(btor bencodeTorrent, info bencodeInfo) (TorrentFile, error) {
+	// SHA-1 hash the entire info dictionary to get the info_hash
+	infoHash := sha1.Sum(btor.Info)
+
+	// split the Pieces blob into the 20-byte SHA-1 hashes for comparison later
+	const hashLen = 20 // length of a SHA-1 hash
+	if len(info.Pieces)%hashLen != 0 {
+		return TorrentFile{}, errors.New("invalid length for info pieces")
+	}
+	pieceHashes := make([][20]byte, len(info.Pieces)/hashLen)
+	for i := 0; i < len(pieceHashes); i++ {
+		piece := info.Pieces[i*hashLen : (i+1)*hashLen]
+		copy(pieceHashes[i][:], piece)
+	}
+
+	// either Length OR Files field must be present (but not both)
+	if info.Length == 0 && len(info.Files) == 0 {
+		return TorrentFile{}, fmt.Errorf("invalid torrent file info dict: no length OR files")
+	}
+
+	var files []File
+	var totalLength int
+	if info.Length != 0 {
+		files = append(files, File{
+			Length:   info.Length,
+			FullPath: info.Name,
+		})
+		totalLength = info.Length
+	} else {
+		for _, f := range info.Files {
+			subPaths := append([]string{info.Name}, f.Path...)
+			file := File{
+				Length:   f.Length,
+				FullPath: filepath.Join(subPaths...),
+			}
+			copy(file.SHA1Hash[:], []byte(f.SHA1Hash))
+			copy(file.MD5Hash[:], []byte(f.MD5Hash))
+			files = append(files, file)
+			totalLength += f.Length
+		}
+	}
+
+	return TorrentFile{
+		Announce:    btor.Announce,
+		InfoHash:    infoHash,
+		PieceHashes: pieceHashes,
+		PieceLength: info.PieceLength,
+		TotalLength: totalLength,
+		Files:       files,
+	}, nil
 }

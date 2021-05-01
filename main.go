@@ -65,10 +65,10 @@ func main() {
 
 	// send jobs to download pieces to jobQueue channel
 	for i, hash := range tf.PieceHashes {
-		// all pieces are the full size except for the last piece?
+		// all pieces are the full size except for the last piece
 		length := tf.PieceLength
 		if i == len(tf.PieceHashes)-1 {
-			length = tf.Length - tf.PieceLength*(len(tf.PieceHashes)-1)
+			length = tf.TotalLength - tf.PieceLength*(len(tf.PieceHashes)-1)
 		}
 		jobQueue <- &Job{
 			Index:  i,
@@ -78,7 +78,7 @@ func main() {
 	}
 
 	// merge results into a final buffer
-	resultBuf := make([]byte, tf.Length)
+	resultBuf := make([]byte, tf.TotalLength)
 	var pieces int
 	for pieces < len(tf.PieceHashes) {
 		piece := <-results
@@ -92,10 +92,27 @@ func main() {
 	// close job queue which will close all peer connections
 	close(jobQueue)
 
-	outPath := filepath.Join(*outDir, tf.Name)
-	fmt.Printf("writing to file %q\n", outPath)
-	err = os.WriteFile(outPath, resultBuf, os.ModePerm)
-	if err != nil {
-		panic("writing to file" + err.Error())
+	// break resultBuf into separate files
+	var usedBytes int
+	for _, file := range tf.Files {
+		outPath := filepath.Join(*outDir, file.FullPath)
+
+		fmt.Printf("writing to file %q\n", outPath)
+		// ensure the directory exists
+		baseDir := filepath.Dir(outPath)
+		_, err := os.Stat(baseDir)
+		if os.IsNotExist(err) {
+			err := os.MkdirAll(baseDir, os.ModePerm)
+			if err != nil {
+				panic("making directory: " + err.Error())
+			}
+		}
+
+		// write to the file
+		err = os.WriteFile(outPath, resultBuf[usedBytes:usedBytes+file.Length], os.ModePerm)
+		usedBytes += file.Length
+		if err != nil {
+			panic("writing to file: " + err.Error())
+		}
 	}
 }

@@ -1,9 +1,20 @@
 # BitTorrent client in Go
 
-Initially based off of a [blog post][jl-blog-post] from Jesse Li to download Ubuntu Server LTS via [torrent][ubuntu-torrent-url]. Using the OG [BitTorrent protocol][BEP0003].
+Initially based off of a [blog post][jl-blog-post] from Jesse Li to implement the [OG BitTorrent protocol][BEP0003].
+
+## Public Domain (aka Legal) Torrents for Testing
+-  Ubuntu Server LTS via [torrent][ubuntu-torrent-url]
+    - single file torrent
+- [NASA Torrents][nasa-torrents], in particular these [images from the Mars Viking Orbiter][example-nasa-torrent].
+    - multi-file torrent
+<!-- todo add the mosaic from nasa?! -->
+
+## Supports
+- Original Spec ([BEP0003][])
+    - Multi-file .torrent files
+    - Original and Compact Peer List formats ([BEP0023][])
 
 ## TODO
-- [ ] Multi-file .torrent files
 - [ ] Implement 'endgame mode' as described in [BEP0003][] for downloading the last few pieces
 - [ ] Seeding in OG .torrent protocol
 - [ ] Magnet links - might go w/ udp trackers
@@ -14,6 +25,7 @@ Initially based off of a [blog post][jl-blog-post] from Jesse Li to download Ubu
 - [ ] DHT
 - [ ] PEX
 - [ ] Announce list - i.e. Multitracker Metadata Extension ([BEP0012])
+- [ ] Some pretty terminal visual of pieces being downloaded?
 
 <!-- reference links -->
 [jl-blog-post]: https://blog.jse.li/posts/torrent/
@@ -23,3 +35,6 @@ Initially based off of a [blog post][jl-blog-post] from Jesse Li to download Ubu
 [BEP0009]:  http://bittorrent.org/beps/bep_0009.html 'Extension for Peers to Send Metadata Files'
 [BEP0041]: http://bittorrent.org/beps/bep_0041.html 'UDP Extensions'
 [BEP0012]: http://bittorrent.org/beps/bep_0012.html 'Multitracker Metadata Extension'
+[nasa-torrents]: https://academictorrents.com/collection/nasa-datasets 'Archives of NASA torrents'
+[example-nasa-torrent]: https://academictorrents.com/details/059ed25558b4587143db637ac3ca94bebb57d88d
+[BEP0023]: http://bittorrent.org/beps/bep_0023.html 'Compact Peer Lists'
