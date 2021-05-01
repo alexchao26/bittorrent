@@ -24,7 +24,7 @@ func main() {
 	// peerID is generated randomly
 	peerID := [20]byte{}
 	rand.Read(peerID[:])
-	// doesn't matter? maybe important for accepting requests from others?
+	// doesn't really matter for just leeching
 	port := 6881
 
 	trackerURL, err := tf.BuildTrackerURL(peerID, port)
@@ -32,26 +32,21 @@ func main() {
 		panic(err)
 	}
 
-	resp, err := GetPeersFromTracker(trackerURL)
+	peers, err := GetPeersFromTracker(trackerURL)
 	if err != nil {
 		panic(err)
 	}
-	peers, err := UnmarshalPeers([]byte(resp.Peers))
-	if err != nil {
-		panic(err)
-	}
+
+	fmt.Println("Peers:", len(peers))
 
 	if len(peers) == 0 {
 		panic("no peers!")
 	}
 
-	fmt.Println("interval", resp.Interval)
-	fmt.Println("Peers:", len(peers))
-
 	// make job queue size the number of pieces, otherwise unbuffered channels
-	// block until "someone" reads a value off hte channel
+	// block until "someone" reads each written value off the channel
 	jobQueue := make(chan *Job, len(tf.PieceHashes))
-	results := make(chan *PieceResult)
+	results := make(chan *Piece)
 
 	// spin up clients concurrently
 	for _, peer := range peers {
@@ -59,11 +54,11 @@ func main() {
 		go func() {
 			peerCli, err := NewPeerClient(peer, tf.InfoHash, peerID)
 			if err != nil {
-				fmt.Printf("creating client with %s: %v\n", peer.String(), err)
+				fmt.Printf("error creating client with %s: %v\n", peer.String(), err)
 				return
 			}
 
-			// start worker
+			// start "worker", i.e. client listening for jobs
 			peerCli.ListenForJobs(jobQueue, results)
 		}()
 	}
@@ -74,8 +69,6 @@ func main() {
 		length := tf.PieceLength
 		if i == len(tf.PieceHashes)-1 {
 			length = tf.Length - tf.PieceLength*(len(tf.PieceHashes)-1)
-			fmt.Printf("Total len %d, pieceLen %d\n", tf.Length, tf.PieceLength)
-			fmt.Println("length is", length)
 		}
 		jobQueue <- &Job{
 			Index:  i,
@@ -96,8 +89,12 @@ func main() {
 		fmt.Printf("%0.2f%% done\n", float64(pieces)/float64(len(tf.PieceHashes))*100)
 	}
 
-	fmt.Println("writing to file")
-	err = os.WriteFile(filepath.Join(*outDir, tf.Name), resultBuf, os.ModePerm)
+	// close job queue which will close all peer connections
+	close(jobQueue)
+
+	outPath := filepath.Join(*outDir, tf.Name)
+	fmt.Printf("writing to file %q\n", outPath)
+	err = os.WriteFile(outPath, resultBuf, os.ModePerm)
 	if err != nil {
 		panic("writing to file" + err.Error())
 	}

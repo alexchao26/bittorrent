@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"crypto/sha1"
 	"errors"
 	"fmt"
@@ -9,7 +8,7 @@ import (
 	"os"
 	"strconv"
 
-	"github.com/jackpal/bencode-go"
+	"github.com/zeebo/bencode"
 )
 
 // Parse and return a TorrentFile that is a useful shape for actual downloading
@@ -25,9 +24,9 @@ type TorrentFile struct {
 	Announce string
 	// SHA-1 hash of entire torrent file's Info field
 	InfoHash [20]byte
-	// individual hashes of each file piece
+	// individual SHA-1 hashes of each file piece
 	PieceHashes [][20]byte
-	// number of bytes(correct unit?) of each file piece
+	// number of bytes of each file piece
 	PieceLength int
 	Length      int
 	Name        string
@@ -35,13 +34,13 @@ type TorrentFile struct {
 
 // ParseTorrentFile parses a torrent file via bencode.Unmarshal
 func ParseTorrentFile(filename string) (TorrentFile, error) {
-	fb, err := os.Open(os.ExpandEnv(filename))
+	f, err := os.Open(os.ExpandEnv(filename))
 	if err != nil {
 		return TorrentFile{}, err
 	}
 
 	var bto bencodeTorrent
-	err = bencode.Unmarshal(fb, &bto)
+	err = bencode.NewDecoder(f).Decode(&bto)
 	if err != nil {
 		return TorrentFile{}, fmt.Errorf("unmarshalling file %w", err)
 	}
@@ -57,25 +56,31 @@ func ParseTorrentFile(filename string) (TorrentFile, error) {
 // serialization struct the represents the structure of a .torrent file
 // it is not immediately usable, so it can be converted to a TorrentFile struct
 type bencodeTorrent struct {
-	Announce string `bencode:"announce"` // URL of tracker server to get peers from
-	Info     struct {
-		Pieces      string `bencode:"pieces"`       // binary blob of all SHA1 hash of each piece
-		PieceLength int    `bencode:"piece length"` // length (in bytes?) of each piece
-		Length      int    `bencode:"length"`       // Length of file
-		Name        string `bencode:"name"`         // Name of file
-	} `bencode:"info"`
+	Announce string      `bencode:"announce"` // URL of tracker server to get peers from
+	Info     bencodeInfo `bencode:"info"`
+}
+
+// this is defined as a separate struct for future expansion of the
+// bencodeTorrent.Info field into bencode.RawMessage type for hashing unknown/
+// unfamiliar shaped info dictionaries
+//
+// Only Length or Files will be present, the other will present as its
+// corresponding Go zero-value
+type bencodeInfo struct {
+	Pieces      string `bencode:"pieces"`       // binary blob of all SHA1 hash of each piece
+	PieceLength int    `bencode:"piece length"` // length in bytes of each piece
+	Name        string `bencode:"name"`         // Name of file (or folder if there are multiple files)
+	Length      int    `bencode:"length"`       // total length of file (in single file case)
 }
 
 func (b bencodeTorrent) toTorrentFile() (TorrentFile, error) {
 	// get info hash by bencode mashalling "info" field & SHA-1 hashing it
-	var infoBuf bytes.Buffer
-	err := bencode.Marshal(&infoBuf, b.Info)
+	infoB, err := bencode.EncodeBytes(b.Info)
 	if err != nil {
 		return TorrentFile{}, err
 	}
-	infoHash := sha1.Sum(infoBuf.Bytes())
+	infoHash := sha1.Sum(infoB)
 
-	// break piece hashes into 20 byte pieces
 	const hashLen = 20 // length of a SHA-1 hash
 
 	// ensure evenly divisible by 20
