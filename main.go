@@ -7,22 +7,37 @@ import (
 	"crypto/sha1"
 	"flag"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
+	"syscall"
 )
 
 func main() {
-	filename := flag.String("file", "", "torrent file")
+	source := flag.String("source", "", "torrent file or magnet link (required)")
 	outDir := flag.String("outdir", "./", "output directory")
+	maxOpenFiles := flag.Uint64("maxOpenFiles", 1024*8, "max number of file descriptors")
 	flag.Parse()
-	if *filename == "" {
-		panic("file flag is required")
+	if *source == "" {
+		panic("source flag is required (torrent file or magnet link)")
 	}
 
-	tf, err := ParseTorrentFile(*filename)
-	if err != nil {
-		panic(err)
+	// set file descriptors 'ulimit -n $FILES'
+	rLimit := syscall.Rlimit{
+		Cur: *maxOpenFiles,
+		Max: *maxOpenFiles,
 	}
+	err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit)
+	if err != nil {
+		panic("updating rlimit: " + err.Error())
+	}
+
+	// Two things we need to start the download
+	var torrent TorrentFile
+	var peerClients []*PeerClient
+	var mut sync.Mutex
 
 	// peerID is generated randomly
 	peerID := [20]byte{}
@@ -30,48 +45,140 @@ func main() {
 	// doesn't really matter for just leeching
 	port := 6881
 
-	trackerURL, err := tf.BuildTrackerURL(peerID, port)
-	if err != nil {
-		panic(err)
-	}
+	if strings.HasPrefix(*source, "magnet") {
+		magnetLink, err := ParseMagnetLink(*source)
+		if err != nil {
+			panic("error parsing magnet link: " + err.Error())
+		}
 
-	peers, err := GetPeersFromTracker(trackerURL)
-	if err != nil {
-		panic(err)
-	}
+		fmt.Println("Parsed Magnet Link", magnetLink)
 
-	fmt.Println("Peers:", len(peers))
+		var peerAddrs []net.TCPAddr
+		var wg sync.WaitGroup
+		wg.Add(len(magnetLink.TrackerURLs))
+		for _, trackerURL := range magnetLink.TrackerURLs {
+			trackerURL := trackerURL
+			go func() {
+				defer wg.Done()
+				addrs, err := GetPeersFromTracker(trackerURL, magnetLink.InfoHash)
+				if err != nil {
+					fmt.Printf("error from tracker %q: %s\n", trackerURL, err.Error())
+					return
+				}
+				mut.Lock()
+				fmt.Println("\t\tpeers from ", trackerURL, ": ", len(addrs))
+				peerAddrs = append(peerAddrs, addrs...)
+				mut.Unlock()
+			}()
+		}
+		wg.Wait()
 
-	if len(peers) == 0 {
-		panic("no peers!")
+		peerAddrs = DedupeAddrs(peerAddrs)
+		fmt.Println("deduped peer count:", len(peerAddrs))
+
+		var metadataBytes []byte
+		wg.Add(len(peerAddrs))
+		for _, addr := range peerAddrs {
+			addr := addr
+			go func() {
+				defer wg.Done()
+				cli, err := NewPeerClient(addr, magnetLink.InfoHash, peerID)
+				if err != nil {
+					fmt.Println("error creating client to", addr, err)
+					return
+				}
+				mut.Lock()
+				peerClients = append(peerClients, cli)
+				mut.Unlock()
+			}()
+		}
+		wg.Wait()
+
+		fmt.Println("peer clients len", len(peerClients))
+
+		for _, cli := range peerClients {
+			fmt.Println("start getting from", cli.conn.RemoteAddr())
+			metadataBytes, err = cli.GetMetadata(magnetLink.InfoHash)
+			if err != nil {
+				fmt.Println("ERROR cli.GetMetadata() ", err)
+			}
+			if err == nil {
+				break
+			}
+		}
+
+		fmt.Println("metadata bytes len", len(metadataBytes))
+
+		if len(metadataBytes) == 0 {
+			panic("failed getting metadata from clients")
+		}
+
+		torrent, err = FromMetadataBytes(metadataBytes)
+		if err != nil {
+			panic("parsing metadata bytes: " + err.Error())
+		}
+	} else if strings.HasSuffix(*source, ".torrent") {
+		var err error
+		torrent, err = ParseTorrentFile(*source)
+		if err != nil {
+			panic(err)
+		}
+
+		trackerURL, err := torrent.BuildTrackerURL(peerID, port)
+		if err != nil {
+			panic(err)
+		}
+
+		peerAddrs, err := GetPeersFromTracker(trackerURL, torrent.InfoHash)
+		if err != nil {
+			panic(err)
+		}
+		fmt.Println("Peers:", len(peerAddrs))
+
+		if len(peerAddrs) == 0 {
+			panic("no peers!")
+		}
+
+		var wg sync.WaitGroup
+		for _, ip := range peerAddrs {
+			// spin up peer clients concurrently
+			ip := ip
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				client, err := NewPeerClient(ip, torrent.InfoHash, peerID)
+				if err != nil {
+					fmt.Println("error connecting to", ip, err)
+					return
+				}
+				mut.Lock()
+				peerClients = append(peerClients, client)
+				mut.Unlock()
+			}()
+		}
+		wg.Wait()
 	}
 
 	// make job queue size the number of pieces, otherwise unbuffered channels
 	// block until "someone" reads each written value off the channel
-	jobQueue := make(chan *Job, len(tf.PieceHashes))
+	jobQueue := make(chan *Job, len(torrent.PieceHashes))
 	results := make(chan *Piece)
 
 	// spin up clients concurrently
-	for _, peer := range peers {
-		peer := peer
+	for _, p := range peerClients {
+		p := p
 		go func() {
-			peerCli, err := NewPeerClient(peer, tf.InfoHash, peerID)
-			if err != nil {
-				fmt.Printf("error creating client with %s: %v\n", peer.String(), err)
-				return
-			}
-
 			// start "worker", i.e. client listening for jobs
-			peerCli.ListenForJobs(jobQueue, results)
+			p.ListenForJobs(jobQueue, results)
 		}()
 	}
 
 	// send jobs to download pieces to jobQueue channel
-	for i, hash := range tf.PieceHashes {
+	for i, hash := range torrent.PieceHashes {
 		// all pieces are the full size except for the last piece
-		length := tf.PieceLength
-		if i == len(tf.PieceHashes)-1 {
-			length = tf.TotalLength - tf.PieceLength*(len(tf.PieceHashes)-1)
+		length := torrent.PieceLength
+		if i == len(torrent.PieceHashes)-1 {
+			length = torrent.TotalLength - torrent.PieceLength*(len(torrent.PieceHashes)-1)
 		}
 		jobQueue <- &Job{
 			Index:  i,
@@ -81,15 +188,15 @@ func main() {
 	}
 
 	// merge results into a final buffer
-	resultBuf := make([]byte, tf.TotalLength)
+	resultBuf := make([]byte, torrent.TotalLength)
 	var pieces int
-	for pieces < len(tf.PieceHashes) {
+	for pieces < len(torrent.PieceHashes) {
 		piece := <-results
 
 		// copy to final buffer
-		copy(resultBuf[piece.Index*tf.PieceLength:], piece.FilePiece)
+		copy(resultBuf[piece.Index*torrent.PieceLength:], piece.FilePiece)
 		pieces++
-		fmt.Printf("%0.2f%% done\n", float64(pieces)/float64(len(tf.PieceHashes))*100)
+		fmt.Printf("%0.2f%% done\n", float64(pieces)/float64(len(torrent.PieceHashes))*100)
 	}
 
 	// close job queue which will close all peer connections
@@ -97,7 +204,7 @@ func main() {
 
 	// break resultBuf into separate files
 	var usedBytes int
-	for _, file := range tf.Files {
+	for _, file := range torrent.Files {
 		outPath := filepath.Join(*outDir, file.FullPath)
 
 		fmt.Printf("writing to file %q\n", outPath)

@@ -1,9 +1,10 @@
 package main
 
 import (
+	"crypto/rand"
 	"encoding/binary"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"net"
 	"net/http"
 	"net/url"
@@ -11,7 +12,7 @@ import (
 	"github.com/zeebo/bencode"
 )
 
-func GetPeersFromTracker(trackerURL string) ([]net.TCPAddr, error) {
+func GetPeersFromTracker(trackerURL string, infoHash [20]byte) ([]net.TCPAddr, error) {
 	u, err := url.Parse(trackerURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tracker URL: %w", err)
@@ -19,10 +20,9 @@ func GetPeersFromTracker(trackerURL string) ([]net.TCPAddr, error) {
 
 	switch u.Scheme {
 	case "http", "https":
-		return getPeersFromHTTPTracker(u)
+		return getPeersFromHTTPTracker(u, infoHash)
 	case "udp":
-		// TODO(alex) get peers via udp
-		return nil, nil
+		return getPeersFromUDPTracker(u, infoHash)
 	default:
 		return nil, fmt.Errorf("unrecognized tracker url scheme: %s", u.Scheme)
 	}
@@ -55,7 +55,23 @@ type originalHTTPTrackerResp struct {
 	Event      string `bencode:"event"`
 }
 
-func getPeersFromHTTPTracker(u *url.URL) ([]net.TCPAddr, error) {
+// todo update to build from infohash and peer id if needed
+func getPeersFromHTTPTracker(u *url.URL, infoHash [20]byte) ([]net.TCPAddr, error) {
+	v := url.Values{}
+	v.Add("info_hash", string(infoHash[:]))
+	// my peer_id (just random). Real bittorrent clients would identify software and version
+	peerID := make([]byte, 20)
+	rand.Read(peerID)
+	v.Add("peer_id", string(peerID[:]))
+	v.Add("port", "6881")
+	v.Add("uploaded", "0")
+	v.Add("downloaded", "0")
+	v.Add("compact", "1") // BEP0023: compact peer list
+	v.Add("left", "0")
+
+	// set url query params
+	u.RawQuery = v.Encode()
+
 	resp, err := http.Get(u.String())
 	if err != nil {
 		return nil, fmt.Errorf("sending get req to http tracker: %w", err)
@@ -64,7 +80,7 @@ func getPeersFromHTTPTracker(u *url.URL) ([]net.TCPAddr, error) {
 
 	// read all the bytes upfront b/c it might need to be unmarshalled into
 	// the original format or the compact format
-	raw, err := ioutil.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("reading response body: %w", err)
 	}
@@ -116,4 +132,24 @@ func getPeersFromHTTPTracker(u *url.URL) ([]net.TCPAddr, error) {
 	}
 
 	return addrs, nil
+}
+
+func getPeersFromUDPTracker(u *url.URL, infoHash [20]byte) ([]net.TCPAddr, error) {
+	udpClient, err := NewUDPTrackerClient(u, infoHash)
+	if err != nil {
+		return nil, err
+	}
+	return udpClient.GetPeers()
+}
+
+func DedupeAddrs(addrs []net.TCPAddr) []net.TCPAddr {
+	deduped := []net.TCPAddr{}
+	set := map[string]bool{}
+	for _, a := range addrs {
+		if !set[a.String()] {
+			deduped = append(deduped, a)
+			set[a.String()] = true
+		}
+	}
+	return deduped
 }

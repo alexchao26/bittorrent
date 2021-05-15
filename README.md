@@ -7,7 +7,7 @@ Initially based off of a [blog post][jl-blog-post] from Jesse Li to implement th
     - single file torrent
 - [NASA Torrents][nasa-torrents], in particular these [images from the Mars Viking Orbiter][example-nasa-torrent].
     - multi-file torrent
-<!-- todo add the mosaic from nasa?! -->
+    - magnet link as well
 
 ## Supports
 - Original Spec ([BEP0003][])

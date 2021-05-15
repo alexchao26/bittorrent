@@ -65,6 +65,26 @@ func ParseTorrentFile(filename string) (TorrentFile, error) {
 	return tf, nil
 }
 
+func FromMetadataBytes(raw []byte) (TorrentFile, error) {
+	var bInfo bencodeInfo
+	err := bencode.DecodeBytes(raw, &bInfo)
+	if err != nil {
+		return TorrentFile{}, fmt.Errorf("decoding metadata bytes: %w", err)
+	}
+
+	tf, err := toTorrentFile(
+		// TODO cleanup toTorrentFile abstraction...
+		bencodeTorrent{
+			Info: raw,
+		}, bInfo)
+	if err != nil {
+		return TorrentFile{}, fmt.Errorf("building torrent file from bytes: %w", err)
+	}
+
+	return tf, nil
+}
+
+// TODO relocate once announce-list is implemented and Torrent struct (entire job) is built
 func (t TorrentFile) BuildTrackerURL(peerID [20]byte, port int) (string, error) {
 	u, err := url.Parse(t.Announce)
 	if err != nil {
