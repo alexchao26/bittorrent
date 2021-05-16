@@ -12,6 +12,7 @@ import (
 
 type Action uint32
 
+// todo this is a bad usecase for iota because the zero value is a valid type (connectAction) change to a typed string
 const (
 	ConnectAction Action = iota
 	AnnounceAction
@@ -19,10 +20,22 @@ const (
 	ErrorAction
 )
 
+var actionStrings = map[Action]string{
+	ConnectAction:  "connect",
+	AnnounceAction: "announce",
+	ScrapeAction:   "scrape",
+	ErrorAction:    "error",
+}
+
+func (a Action) String() string {
+	return actionStrings[a]
+}
+
 type UDPTrackerClient struct {
 	conn         net.Conn
 	peerID       [20]byte
 	infoHash     [20]byte
+	port         int
 	peers        []net.TCPAddr
 	connectionID uint64
 }
@@ -31,19 +44,17 @@ type UDPTrackerClient struct {
 // Tracker Server. It is used with magnet links to locate peers without DHT.
 //
 // BEP0015 spec: http://bittorrent.org/beps/bep_0015.html
-func NewUDPTrackerClient(trURL *url.URL, infoHash [20]byte) (*UDPTrackerClient, error) {
+func NewUDPTrackerClient(trURL *url.URL, infoHash, peerID [20]byte, port int) (*UDPTrackerClient, error) {
 	conn, err := net.DialTimeout("udp", trURL.Host, time.Second*5)
 	if err != nil {
 		return nil, fmt.Errorf("dialing %s: %w", trURL.String(), err)
 	}
 
-	var peerID [20]byte
-	rand.Read(peerID[:])
-
 	return &UDPTrackerClient{
 		conn:     conn,
 		peerID:   peerID,
 		infoHash: infoHash,
+		port:     port,
 	}, nil
 }
 
@@ -60,48 +71,38 @@ func (u *UDPTrackerClient) GetPeers() ([]net.TCPAddr, error) {
 	return u.peers, nil
 }
 
-// Connect is the first message sent to a UDP Tracker Server to acquire a Connection ID
-// which is stored on the UDPTrackerClient for the AnnounceAction request
+// Connect is the first message sent to a UDP Tracker Server to acquire a
+// Connection ID to use for future requests (namely Announce)
 func (u *UDPTrackerClient) connect() error {
 	const protocolID = 0x41727101980 // magic constant
 	transactionID := rand.Uint32()
 
-	announceMsg := make([]byte, 8+4+4)
-	binary.BigEndian.PutUint64(announceMsg[0:], uint64(protocolID))
-	binary.BigEndian.PutUint32(announceMsg[8:], uint32(ConnectAction))
-	binary.BigEndian.PutUint32(announceMsg[12:], transactionID)
+	connectMsg := make([]byte, 16)
+	binary.BigEndian.PutUint64(connectMsg[0:8], uint64(protocolID))
+	binary.BigEndian.PutUint32(connectMsg[8:12], uint32(ConnectAction))
+	binary.BigEndian.PutUint32(connectMsg[12:16], transactionID)
 
-	// fmt.Println("connect msg", announceMsg)
-
-	// set a deadline
 	u.conn.SetDeadline(time.Now().Add(time.Second * 3))
+	defer u.conn.SetDeadline(time.Time{}) // clear deadlines
 
-	_, err := u.conn.Write(announceMsg)
+	_, err := u.conn.Write(connectMsg)
 	if err != nil {
-		return fmt.Errorf("writing to udp connection: %w", err)
+		return fmt.Errorf("sending connect msg to udp tracker: %w", err)
 	}
 
-	// Read connect response/output from server
-	buf := make([]byte, 16)
-	n, err := io.ReadFull(u.conn, buf)
+	// Read connect response from server
+	resp := make([]byte, 16)
+	_, err = io.ReadFull(u.conn, resp)
 	if err != nil {
-		return fmt.Errorf("reading: %w", err)
+		return fmt.Errorf("reading connect resp: %w", err)
 	}
-	if n != 16 {
-		return fmt.Errorf("connect response, want 16 bytes, got %d", n)
-	}
-
-	respAction := binary.BigEndian.Uint32(buf[0:4])
-	respTransactionID := binary.BigEndian.Uint32(buf[4:8])
-	if respAction != uint32(ConnectAction) {
-		return fmt.Errorf("expected action 0, connect; got %d", respAction)
-	}
-	if respTransactionID != transactionID {
-		return fmt.Errorf("transactionIDs do not match, want %d got %d", transactionID, respTransactionID)
+	connectResp, err := u.parseUDPResponse(transactionID, ConnectAction, resp)
+	if err != nil {
+		return fmt.Errorf("udp connect resp: %w", err)
 	}
 
-	u.connectionID = binary.BigEndian.Uint64(buf[8:16])
-	// fmt.Printf("connectionID is %d\n", u.connectionID)
+	// store connection id on client
+	u.connectionID = binary.BigEndian.Uint64(connectResp)
 
 	return nil
 }
@@ -114,68 +115,55 @@ func (u *UDPTrackerClient) announce() error {
 	transactionID := rand.Uint32()
 	binary.BigEndian.PutUint32(announceMsg[12:16], transactionID)
 	copy(announceMsg[16:36], u.infoHash[:])
-
-	// random peer id
 	copy(announceMsg[36:56], u.peerID[:])
 
 	binary.BigEndian.PutUint64(announceMsg[56:64], 0) // downloaded
-	binary.BigEndian.PutUint64(announceMsg[64:72], 0) // left // todo we kind of don't know this upfront?!
+	binary.BigEndian.PutUint64(announceMsg[64:72], 0) // left, unknown w/ magnet links
 	binary.BigEndian.PutUint64(announceMsg[72:80], 0) // uploaded
 
 	binary.BigEndian.PutUint32(announceMsg[80:84], 0) // event 0:none; 1:completed; 2:started; 3:stopped
 	binary.BigEndian.PutUint32(announceMsg[84:88], 0) // IP address, default: 0
 
-	binary.BigEndian.PutUint32(announceMsg[88:92], rand.Uint32()) // key - not really sure what this is
+	binary.BigEndian.PutUint32(announceMsg[88:92], rand.Uint32()) // key - for tracker's statistics
 
-	// trick language into wrapping a negative unsigned int, it underflows
+	// trick go into allowing a negative unsigned int, it underflows
 	neg1 := -1
-	binary.BigEndian.PutUint32(announceMsg[92:96], uint32(neg1)) // num_want -1 default
-	binary.BigEndian.PutUint16(announceMsg[96:98], uint16(6881)) // port
+	binary.BigEndian.PutUint32(announceMsg[92:96], uint32(neg1))   // num_want -1 default
+	binary.BigEndian.PutUint16(announceMsg[96:98], uint16(u.port)) // port
 
 	u.conn.SetDeadline(time.Now().Add(time.Second * 5))
 	defer u.conn.SetDeadline(time.Time{}) // clear deadlines
 
-	// fmt.Println("writing announce message", announceMsg)
 	_, err := u.conn.Write(announceMsg)
 	if err != nil {
 		return fmt.Errorf("writing announce msg: %w", err)
 	}
 
-	// don't know upfront how many bytes the message will be, so just make a big ass buffer
+	// don't know upfront how many bytes a UDP message will be, so just allocate a big enough buffer
+	// and resize it after
 	resp := make([]byte, 4096)
 	n, err := u.conn.Read(resp)
 	if err != nil {
 		return fmt.Errorf("reading announce response: %w", err)
 	}
-
-	// adjust length of response buffer based on number of bytes read
-	// workaround for not being able to read a UDP packet in pieces and not knowing its size upfront
 	resp = resp[:n]
-
-	if n < 20 {
-		return fmt.Errorf("announce response must be at least 20 characters, got %d", n)
-	}
-	action := binary.BigEndian.Uint32(resp[0:4])
-	if Action(action) != AnnounceAction {
-		return fmt.Errorf("unexpected action on response from announce %v", action)
-	}
-	respTransactionID := binary.BigEndian.Uint32(resp[4:8])
-	if transactionID != respTransactionID {
-		return fmt.Errorf("transaction ids do not match in announce resp")
+	announceResp, err := u.parseUDPResponse(transactionID, AnnounceAction, resp)
+	if err != nil {
+		return fmt.Errorf("udp announce resp: %w", err)
 	}
 
-	interval := binary.BigEndian.Uint32(resp[8:12])
-	leecher := binary.BigEndian.Uint32(resp[12:16])
-	seeders := binary.BigEndian.Uint32(resp[16:20])
+	interval := binary.BigEndian.Uint32(announceResp[0:4])
+	leecher := binary.BigEndian.Uint32(announceResp[4:8])
+	seeders := binary.BigEndian.Uint32(announceResp[8:12])
 	// currently unused statistics
 	_, _, _ = interval, leecher, seeders
 
 	var peers []net.TCPAddr
-	for i := 20; i < len(resp); i += 6 {
+	for i := 12; i < len(announceResp); i += 6 {
 		// parse 6 bytes for peer's ip (4 bytes) and port (2 bytes)
 		peers = append(peers, net.TCPAddr{
-			IP:   resp[i : i+4],
-			Port: int(binary.BigEndian.Uint16(resp[i+4 : i+6])),
+			IP:   announceResp[i : i+4],
+			Port: int(binary.BigEndian.Uint16(announceResp[i+4 : i+6])),
 		})
 	}
 
@@ -187,11 +175,13 @@ func (u *UDPTrackerClient) announce() error {
 	return nil
 }
 
-// Scrape gets data on the torrent including seeders, completed and leechers.
+// scrape gets data on the torrent including seeders, completed and leechers.
 // I'm not sure if it's necessary to use for a client... Once I get all peers
 // from `announce` I feel like I'm good to go?
 //
 // This implementation is limited to scraping data of a SINGLE torrent
+//
+// Currently scrape is unused and this implementation only returns an error
 func (u *UDPTrackerClient) scrape() error {
 	transactionID := rand.Uint32()
 	scrapeMsg := make([]byte, 36)
@@ -208,47 +198,52 @@ func (u *UDPTrackerClient) scrape() error {
 
 	// limiting to one torrent so msg should be 20 bytes
 	respScrape := make([]byte, 20)
-	n, err := u.conn.Read(respScrape)
+	_, err = u.conn.Read(respScrape)
 	if err != nil {
 		return fmt.Errorf("reading scrape msg: %w", err)
 	}
-	if n != 20 {
-		return fmt.Errorf("expected 20 byte scrape response, got %d", n)
-	}
-	action := binary.BigEndian.Uint32(respScrape[0:4])
-	if Action(action) != ScrapeAction {
-		return fmt.Errorf("expected scrape action response, got %v", Action(action))
+	resp, err := u.parseUDPResponse(transactionID, ScrapeAction, respScrape)
+	if err != nil {
+		return fmt.Errorf("udp scrape resp: %w", err)
 	}
 
-	respTransactionID := binary.BigEndian.Uint32(respScrape[4:8])
-	if respTransactionID != transactionID {
-		return fmt.Errorf("transaction ids do not match")
-	}
+	seeders := binary.BigEndian.Uint32(resp[0:4])
+	completed := binary.BigEndian.Uint32(resp[4:8])
+	leechers := binary.BigEndian.Uint32(resp[8:12])
 
-	seeders := binary.BigEndian.Uint32(respScrape[8:12])
-	completed := binary.BigEndian.Uint32(respScrape[12:16])
-	leechers := binary.BigEndian.Uint32(respScrape[16:20])
-
-	// unused currently
+	// unimplemented
 	_, _, _ = seeders, completed, leechers
 
 	return nil
 }
 
-// ParseErrorMsg currently receives the entire message byte slice
-// TODO refactor into a ReadMsg type for all UDP Tracker Responses?
-func (u *UDPTrackerClient) parseErrorMsg(msg []byte) (string, error) {
-	if len(msg) < 8 {
-		return "", fmt.Errorf("error message is <8 characters, got %d", len(msg))
+// parseUDPResponse is a helper function that checks if the response has a
+// matching transactionID and action type.
+//
+// In the event of an 'error' response, it includes the error message in the
+// returned error.
+//
+// If there is no error it returns the rest of the response (index 8 to the end)
+// for the caller to handle.
+func (u *UDPTrackerClient) parseUDPResponse(wantTransactionID uint32, wantAction Action, resp []byte) ([]byte, error) {
+	if len(resp) < 8 {
+		return nil, fmt.Errorf("response is <8 characters, got %d", len(resp))
 	}
-	action := binary.BigEndian.Uint32(msg[0:4])
-	if Action(action) != ErrorAction {
-		return "", fmt.Errorf("expected error action")
-	}
-	respTransactionID := binary.BigEndian.Uint32(msg[4:8])
-	// todo compare to transactionID of original message
-	_ = respTransactionID
 
-	message := string(msg[8:])
-	return message, nil
+	respTransactionID := binary.BigEndian.Uint32(resp[4:8])
+	if respTransactionID != wantTransactionID {
+		return nil, fmt.Errorf("transactionIDs do not match, want %d, got %d", wantTransactionID, respTransactionID)
+	}
+
+	action := binary.BigEndian.Uint32(resp[0:4])
+	if Action(action) == ErrorAction {
+		// return an error that includes the message
+		errorText := string(resp[8:])
+		return nil, fmt.Errorf("error response: %s", errorText)
+	}
+	if Action(action) != wantAction {
+		return nil, fmt.Errorf("want %s action, got %s", wantAction, Action(action))
+	}
+
+	return resp[8:], nil
 }

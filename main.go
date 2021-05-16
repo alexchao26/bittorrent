@@ -60,7 +60,7 @@ func main() {
 			trackerURL := trackerURL
 			go func() {
 				defer wg.Done()
-				addrs, err := GetPeersFromTracker(trackerURL, magnetLink.InfoHash)
+				addrs, err := GetPeersFromTracker(trackerURL, magnetLink.InfoHash, peerID, port)
 				if err != nil {
 					fmt.Printf("error from tracker %q: %s\n", trackerURL, err.Error())
 					return
@@ -124,12 +124,7 @@ func main() {
 			panic(err)
 		}
 
-		trackerURL, err := torrent.BuildTrackerURL(peerID, port)
-		if err != nil {
-			panic(err)
-		}
-
-		peerAddrs, err := GetPeersFromTracker(trackerURL, torrent.InfoHash)
+		peerAddrs, err := GetPeersFromTracker(torrent.Announce, torrent.InfoHash, peerID, port)
 		if err != nil {
 			panic(err)
 		}

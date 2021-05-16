@@ -21,11 +21,13 @@ type PeerClient struct {
 		messageID    int // from ut_metadata in handshake
 		metadataSize int
 	}
-
-	rawMetadata []byte // internal buffer for metadata acquired per BEP0009
 }
 
-// NewPeerClient initializes a connection with a peer, completing the handshake
+// NewPeerClient initializes a connection with a peer, then:
+//   - completes the handshake
+//   - completes the extension handshake if applicable
+//   - receives the bitfield message
+//   - sends an unchoke and interested message to the peer
 func NewPeerClient(peerAddr net.TCPAddr, infoHash, peerID [20]byte) (*PeerClient, error) {
 	conn, err := net.DialTimeout("tcp", peerAddr.String(), 5*time.Second)
 	if err != nil {
@@ -42,7 +44,7 @@ func NewPeerClient(peerAddr net.TCPAddr, infoHash, peerID [20]byte) (*PeerClient
 
 	err = cli.handshake(infoHash, peerID)
 	if err != nil {
-		return nil, fmt.Errorf("making handshake: %w", err)
+		return nil, fmt.Errorf("completing handshake: %w", err)
 	}
 
 	if cli.supportsExtension {
@@ -56,15 +58,28 @@ func NewPeerClient(peerAddr net.TCPAddr, infoHash, peerID [20]byte) (*PeerClient
 
 	// receive bitfield message
 	cli.conn.SetDeadline(time.Now().Add(time.Second * 3))
-	_, _, err = cli.receiveMessage(nil)
+	_, err = cli.receiveMessage()
 	if err != nil {
 		return nil, fmt.Errorf("receiving bitfield message: %w", err)
+	}
+	if len(cli.bitfield) == 0 {
+		return nil, fmt.Errorf("bitfield not set")
+	}
+
+	// send unchoke and interested message so the peer is ready for requests
+	err = cli.sendMessage(msgUnchoke, nil)
+	if err != nil {
+		return nil, fmt.Errorf("sending unchoke: %w", err)
+	}
+	err = cli.sendMessage(msgInterested, nil)
+	if err != nil {
+		return nil, fmt.Errorf("sending interested: %w", err)
 	}
 
 	return cli, nil
 }
 
-// Attempt to handshake with the underlying peer
+// handshake completes the entire handshake process with the underlying peer
 func (p *PeerClient) handshake(infoHash, peerID [20]byte) error {
 	const protocol = "BitTorrent protocol"
 	var buf bytes.Buffer
@@ -121,7 +136,7 @@ func (p *PeerClient) handshake(infoHash, peerID [20]byte) error {
 	copy(p.peerID[:], handshakeBuf[read:])
 
 	if !bytes.Equal(respInfoHash[:], infoHash[:]) {
-		return fmt.Errorf("expected infohash %v but got %v", infoHash, respInfoHash)
+		return fmt.Errorf("infohashes do not match")
 	}
 
 	return nil
@@ -143,16 +158,6 @@ type Piece struct {
 
 func (p *PeerClient) ListenForJobs(jobQueue chan *Job, results chan<- *Piece) error {
 	defer p.conn.Close()
-
-	// begin by sending unchoke and interested
-	err := p.sendMessage(msgUnchoke, nil)
-	if err != nil {
-		return fmt.Errorf("sending unchoke to %s: %w", p.conn.RemoteAddr(), err)
-	}
-	err = p.sendMessage(msgInterested, nil)
-	if err != nil {
-		return fmt.Errorf("sending interested to %s: %w", p.conn.RemoteAddr(), err)
-	}
 
 	// receive jobs off the job queue channel
 	// in any situation where the peer cannot or fails to send us a piece, return the job to the
@@ -197,13 +202,34 @@ func (p *PeerClient) ListenForJobs(jobQueue chan *Job, results chan<- *Piece) er
 				requested += blockSize
 				backlog++
 			}
+			if p.isChoked {
+				err := p.sendMessage(msgUnchoke, nil)
+				if err != nil {
+					return fmt.Errorf("sending unchoke: %w", err)
+				}
+			}
 
-			n, _, err := p.receiveMessage(pieceBuf)
+			msg, err := p.receiveMessage()
 			if err != nil {
 				// if there was an error, kill this peer
 				jobQueue <- job
 				return fmt.Errorf("receiving message from %s: %w", p.conn.RemoteAddr(), err)
 			}
+			if msg.id != msgPiece {
+				continue
+			}
+			// piece format: <index, uint32><begin offset, uint32><data []byte>
+			index := binary.BigEndian.Uint32(msg.payload[0:4])
+			if index != uint32(job.Index) {
+				// possible for a client to send the "wrong" piece, just ignore it
+				continue
+			}
+
+			// should error handle against the job's index?
+			begin := binary.BigEndian.Uint32(msg.payload[4:8])
+			blockData := msg.payload[8:]
+			// copy the block/data into the piece buffer
+			n := copy(pieceBuf[begin:], blockData[:])
 
 			// keep track of the number of received bytes and the backlog size
 			received += n
@@ -220,8 +246,7 @@ func (p *PeerClient) ListenForJobs(jobQueue chan *Job, results chan<- *Piece) er
 			return fmt.Errorf("failed integrity check from %s", p.conn.RemoteAddr())
 		}
 
-		// tell peer we HAVE this piece now
-		// TODO this should be relayed to ALL peers, might require a mutex for p.conn.Write?
+		// tell peer we have this piece now
 		havePayload := make([]byte, 4)
 		binary.BigEndian.PutUint32(havePayload, uint32(job.Index))
 		p.sendMessage(msgHave, havePayload) // ignore errors
@@ -237,10 +262,12 @@ func (p *PeerClient) ListenForJobs(jobQueue chan *Job, results chan<- *Piece) er
 }
 
 // messageID are the types of messages that can be sent
-type messageID uint8
+type messageID int
 
+// todo this is a bad usecase for iota because the zero value is a valid type (msgChoke) change to a typed string
 const (
-	msgChoke messageID = iota
+	msgKeepAlive messageID = iota - 1
+	msgChoke
 	msgUnchoke
 	msgInterested
 	msgNotInterested
@@ -288,26 +315,30 @@ func (p *PeerClient) sendMessage(id messageID, payload []byte) error {
 	return nil
 }
 
+type message struct {
+	id      messageID
+	payload []byte
+}
+
 // receiveMessage reads a message from the peer and processes it.
 // Processing a message can change the state of the peer (choked/unchoked,
-// its bitmap) and the state of the piece that is currently being downloaded
-// into the pieceBuffer.
+// its bitmap).
 //
-// The number of bytes processed is returned as the first variable to indicate
-// when a piece is received, as opposed to a different Message type.
-func (p *PeerClient) receiveMessage(pieceBuffer []byte) (nPiece, nExtension int, err error) {
+// A non-zero value message is only returned for messages that require further
+// handling based on the caller i.e. piece and extended messages
+func (p *PeerClient) receiveMessage() (message, error) {
 	// Receive and parse the message <length><id><payload>
 	// 4 bytes that represent the length of the rest of the message
 	lengthBuf := make([]byte, 4)
-	_, err = io.ReadFull(p.conn, lengthBuf)
+	_, err := io.ReadFull(p.conn, lengthBuf)
 	if err != nil {
-		return 0, 0, fmt.Errorf("reading message length: %w", err)
+		return message{}, fmt.Errorf("reading message length: %w", err)
 	}
 
 	messageLength := binary.BigEndian.Uint32(lengthBuf)
 	if messageLength == 0 {
 		// keep-alive message
-		return 0, 0, nil
+		return message{id: msgKeepAlive}, nil
 	}
 
 	// buffer to contain the rest of the message, 1 byte for the messageID, the
@@ -315,7 +346,7 @@ func (p *PeerClient) receiveMessage(pieceBuffer []byte) (nPiece, nExtension int,
 	messageBuf := make([]byte, messageLength)
 	_, err = io.ReadFull(p.conn, messageBuf)
 	if err != nil {
-		return 0, 0, fmt.Errorf("reading message payload: %w", err)
+		return message{}, fmt.Errorf("reading message payload: %w", err)
 	}
 	messageID := messageID(messageBuf[0])
 	messagePayload := messageBuf[1:]
@@ -338,32 +369,24 @@ func (p *PeerClient) receiveMessage(pieceBuffer []byte) (nPiece, nExtension int,
 	case msgRequest:
 		// not implemented, purely leeching
 	case msgPiece:
-		// piece format: <index, uint32><begin offset, uint32><data []byte>
-		index := binary.BigEndian.Uint32(messagePayload[0:4])
-		_ = index // unused b/c accessible via Job struct
-
-		// should error handle against the job's index?
-		begin := binary.BigEndian.Uint32(messagePayload[4:8])
-		blockData := messagePayload[8:]
-		// copy the block/data into the piece buffer
-		n := copy(pieceBuffer[begin:], blockData[:])
-		return n, 0, nil
+		return message{
+			id:      msgPiece,
+			payload: messagePayload,
+		}, nil
 	case msgCancel:
 		// a leech shouldn't receive a cancel message, so error out here
-		return 0, 0, errors.New("received CANCEL")
+		return message{}, errors.New("received CANCEL")
 	case msgExtended:
-		// todo implement receiving additional extended messages from clients to update extensions
-		n, err := p.processExtendedMessage(messagePayload)
-		if err != nil {
-			return 0, 0, fmt.Errorf("processing extended message: %w", err)
-		}
-		return 0, n, nil
-
+		return message{
+			id:      msgExtended,
+			payload: messagePayload,
+		}, nil
 	default:
-		return 0, 0, fmt.Errorf("received unrecognized message type: %s", messageID.String())
+		return message{}, fmt.Errorf("received unrecognized message type: %s", messageID.String())
 	}
 
-	return 0, 0, nil
+	// todo currently this returns a message with id msgChoke b/c that's the zero value. Fix along with removing iotas
+	return message{}, nil
 }
 
 // bitfield communicates which pieces a peer has and can send us
@@ -386,10 +409,10 @@ func (b bitfield) hasPiece(index int) bool {
 // setPiece updates the bitfield to indicate that the peer can send that piece
 func (b bitfield) setPiece(index int) {
 	byteIndex := index / 8
-	// todo shield against the bitfield being uninitialized
-	// if len(b) <= byteIndex {
-	// 	b = make([]byte, index)
-	// }
+	// discard if index is out of range of bitfield
+	if byteIndex >= len(b) {
+		return
+	}
 	offset := index % 8
 	mask := 1 << (7 - offset)
 	b[byteIndex] |= byte(mask)

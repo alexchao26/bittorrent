@@ -4,10 +4,8 @@ import (
 	"crypto/sha1"
 	"errors"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
-	"strconv"
 
 	"github.com/zeebo/bencode"
 )
@@ -54,7 +52,7 @@ func ParseTorrentFile(filename string) (TorrentFile, error) {
 	var info bencodeInfo
 	err = bencode.DecodeBytes(btor.Info, &info)
 	if err != nil {
-		return TorrentFile{}, fmt.Errorf("umarshalling info dict: %w", err)
+		return TorrentFile{}, fmt.Errorf("unmarshalling info dict: %w", err)
 	}
 
 	tf, err := toTorrentFile(btor, info)
@@ -82,28 +80,6 @@ func FromMetadataBytes(raw []byte) (TorrentFile, error) {
 	}
 
 	return tf, nil
-}
-
-// TODO relocate once announce-list is implemented and Torrent struct (entire job) is built
-func (t TorrentFile) BuildTrackerURL(peerID [20]byte, port int) (string, error) {
-	u, err := url.Parse(t.Announce)
-	if err != nil {
-		return "", err
-	}
-	v := url.Values{}
-	v.Add("info_hash", string(t.InfoHash[:]))
-	// my peer_id (just random). Real bittorrent clients would identify software and version
-	v.Add("peer_id", string(peerID[:]))
-	v.Add("port", strconv.Itoa(port))
-	v.Add("uploaded", "0")
-	v.Add("downloaded", "0")
-	v.Add("compact", "1") // BEP0023: compact peer list
-	v.Add("left", strconv.Itoa(t.TotalLength))
-
-	// set url query params
-	u.RawQuery = v.Encode()
-
-	return u.String(), nil
 }
 
 // serialization struct the represents the structure of a .torrent file

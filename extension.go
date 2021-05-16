@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
@@ -34,66 +33,28 @@ type metadataData struct {
 	TotalSize int                   `bencode:"total_size"`
 }
 
-// currently unused
-type metadataReject struct {
-	Type  int `bencode:"msg_type"`
-	Piece int `bencode:"piece"`
-}
-
-const metadataPieceSize = 16384 // 16KiB
+// todo implement a readMetadata message which can switch onto a metadataReject?
+// type metadataReject struct {
+// 	Type  int `bencode:"msg_type"`
+// 	Piece int `bencode:"piece"`
+// }
 
 func (p *PeerClient) GetMetadata(infoHash [20]byte) ([]byte, error) {
 	if p.metadataExtension.messageID == 0 || p.metadataExtension.metadataSize == 0 {
-		return nil, fmt.Errorf("client (%s) does not support metadata extension", p.conn.RemoteAddr())
+		return nil, fmt.Errorf("client does not support metadata extension")
 	}
 	defer p.conn.SetDeadline(time.Time{})
 
-	// send unchoke and intersted
-	err := p.sendMessage(msgUnchoke, nil)
-	if err != nil {
-		return nil, fmt.Errorf("sending unchoke: %w", err)
-	}
-	err = p.sendMessage(msgInterested, nil)
-	if err != nil {
-		return nil, fmt.Errorf("sending interetsed: %w", err)
-	}
+	metadataBuf := make([]byte, p.metadataExtension.metadataSize)
 
-	p.rawMetadata = make([]byte, p.metadataExtension.metadataSize)
+	const metadataPieceSize = 16384 // 16KiB
 
-	// // calculate number of pieces
-	// pieces := int(math.Ceil(float64(p.metadataExtension.metadataSize) / float64(metadataPieceSize)))
-
-	// // send all piece requests upfront, one peer should be able to handle it
-	// for i := 0; i < pieces; i++ {
-	// 	var buf bytes.Buffer
-
-	// 	// write the message id for the extension protocol
-	// 	buf.WriteByte(byte(p.metadataExtension.messageID))
-
-	// 	msgRaw, err := bencode.EncodeBytes(metadataRequest{
-	// 		Type:  request,
-	// 		Piece: i,
-	// 	})
-	// 	if err != nil {
-	// 		return nil, fmt.Errorf("bencoding metadata req: %w", err)
-	// 	}
-	// 	buf.Write(msgRaw)
-
-	// 	p.conn.SetDeadline(time.Now().Add(time.Second * 3))
-	// 	err = p.sendMessage(msgExtended, buf.Bytes())
-	// 	if err != nil {
-	// 		return nil, fmt.Errorf("sending metadata piece request: %w", err)
-	// 	}
-	// }
-
-	var requested int
-	var received int
+	var requested, received int
 	for received < p.metadataExtension.metadataSize {
-		// do not build up a backlog/TCP pipeline for metadata requests
-		// in my experience that will cause issues
+		// request one piece at a time, in my experience, clients don't like backlogging/pipelining
+		// metadata piece requests  and they'll end up sending the first piece only
 		if requested <= received/metadataPieceSize {
 			var buf bytes.Buffer
-
 			// write the message id for the extension protocol
 			buf.WriteByte(byte(p.metadataExtension.messageID))
 
@@ -109,26 +70,69 @@ func (p *PeerClient) GetMetadata(infoHash [20]byte) ([]byte, error) {
 			p.conn.SetDeadline(time.Now().Add(time.Second * 3))
 			err = p.sendMessage(msgExtended, buf.Bytes())
 			if err != nil {
-				return nil, fmt.Errorf("sending metadata piece request: %w", err)
+				return nil, fmt.Errorf("sending metadata request: %w", err)
 			}
 			requested++
 		}
+
 		// update deadline for reading each piece
-		// long ass deadline for reading each piece
-		p.conn.SetDeadline(time.Now().Add(time.Second * 15))
-		_, n, err := p.receiveMessage(nil)
+		p.conn.SetDeadline(time.Now().Add(time.Second * 5))
+		msg, err := p.receiveMessage()
 		if err != nil {
-			return nil, fmt.Errorf("attempting to get metadata piece: %w", err)
+			return nil, fmt.Errorf("receiving metadata piece: %w", err)
 		}
-		received += n
+		// clients will send non-extended messages, like unchoke/have, ignore them
+		if msg.id != msgExtended {
+			continue
+		}
+
+		// process the extended message http://www.bittorrent.org/beps/bep_0010.html
+		extMsgID := uint8(msg.payload[0])
+		// expect extension message id to match, although in practice it's always been zero
+		_ = extMsgID
+		// if int(extMsgID) != p.metadataExtension.messageID {
+		// 	return fmt.Errorf("metadata extension ids do not match: want %d, got %d", p.metadataExtension.messageID, extMsgID)
+		// }
+
+		extPayload := msg.payload[1:]
+		// read bytes until end of bencoded dictionary ("ee" ends total_size integer then dictionary)
+		var dictRaw []byte
+		for i := 1; i < len(extPayload); i++ {
+			if string(extPayload[i-1:i+1]) == "ee" {
+				dictRaw = extPayload[:i+1]
+				break
+			}
+		}
+		if len(dictRaw) == 0 {
+			return nil, fmt.Errorf("malformed extension dictionary")
+		}
+
+		var data metadataData
+		err = bencode.DecodeBytes(dictRaw, &data)
+		if err != nil {
+			return nil, fmt.Errorf("decoding bencoded extension dictionary: %w", err)
+		}
+
+		if data.Type != 1 {
+			return nil, fmt.Errorf("expected data type (1), got %d", data.Type)
+		}
+		if data.TotalSize != p.metadataExtension.metadataSize {
+			return nil, fmt.Errorf("got metadata data.total_size %d, want %d", data.TotalSize, p.metadataExtension.metadataSize)
+		}
+
+		// piece bytes are after the dictionary
+		pieceRaw := extPayload[len(dictRaw):]
+
+		// copy into metadata buffer & update the number of received bytes
+		received += copy(metadataBuf[data.Piece*metadataPieceSize:], pieceRaw[:])
 	}
 
 	// validate metadata via SHA-1
-	hash := sha1.Sum(p.rawMetadata)
+	hash := sha1.Sum(metadataBuf)
 	if !bytes.Equal(hash[:], infoHash[:]) {
-		return nil, fmt.Errorf("metadata failed integrity check from %s", p.conn.RemoteAddr())
+		return nil, fmt.Errorf("metadata failed integrity check")
 	}
-	return p.rawMetadata, nil
+	return metadataBuf, nil
 }
 
 func (p *PeerClient) receiveExtendedHandshake() error {
@@ -173,63 +177,8 @@ func (p *PeerClient) receiveExtendedHandshake() error {
 		return fmt.Errorf("decoding extended handshake msg: %w", err)
 	}
 
-	// fmt.Printf("\textended handhshake msg: %+v\n", extendedResp)
-
 	p.metadataExtension.messageID = extendedResp.M.Metadata
 	p.metadataExtension.metadataSize = extendedResp.MetadataSize
 
-	fmt.Printf("DONE with extended handshake with %s\n", p.conn.RemoteAddr())
-
 	return nil
-}
-
-// http://www.bittorrent.org/beps/bep_0010.html
-func (p *PeerClient) processExtendedMessage(messagePayload []byte) (int, error) {
-	extMsgID := uint8(messagePayload[0])
-	payload := messagePayload[1:]
-	fmt.Println("extended message ID is: ", extMsgID)
-
-	// TODO this is behaving unexpectedly
-	// // expect extension message id to match
-	fmt.Println("msg ids misbehaving??", extMsgID, p.metadataExtension.messageID)
-	// if int(extMsgID) != p.metadataExtension.messageID {
-	// 	return fmt.Errorf("metadata extension ids do not match: want %d, got %d", p.metadataExtension.messageID, extMsgID)
-	// }
-
-	// length of the message dictionary is the entire length minus:
-	// 1 for pieceLength byte and length of piece itself
-
-	dictRaw := []byte{}
-	bufReader := bufio.NewReader(bytes.NewReader(payload))
-	for {
-		b, err := bufReader.ReadByte()
-		if err != nil {
-			return 0, fmt.Errorf("reading extension dictionary byte: %w", err)
-		}
-		dictRaw = append(dictRaw, b)
-		if l := len(dictRaw); l > 2 && string(dictRaw[l-2:]) == "ee" {
-			break
-		}
-	}
-
-	fmt.Println("dictionary bytes as string...", string(dictRaw), p.conn.RemoteAddr())
-
-	var data metadataData
-	err := bencode.DecodeBytes(dictRaw, &data)
-	if err != nil {
-		return 0, fmt.Errorf("decoding bencoded extension dictionary: %w", err)
-	}
-	msgType := data.Type
-	piece := data.Piece
-	// totalSize := data.TotalSize // unused
-
-	if msgType != 1 {
-		return 0, fmt.Errorf("expected data type (1), got %d", msgType)
-	}
-
-	// piece bytes are after the dictionary
-	pieceRaw := payload[len(dictRaw):]
-
-	copy(p.rawMetadata[piece*metadataPieceSize:], pieceRaw[:])
-	return len(pieceRaw), nil
 }

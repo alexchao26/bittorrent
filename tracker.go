@@ -1,18 +1,18 @@
 package main
 
 import (
-	"crypto/rand"
 	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
 	"net/url"
+	"strconv"
 
 	"github.com/zeebo/bencode"
 )
 
-func GetPeersFromTracker(trackerURL string, infoHash [20]byte) ([]net.TCPAddr, error) {
+func GetPeersFromTracker(trackerURL string, infoHash, peerID [20]byte, port int) ([]net.TCPAddr, error) {
 	u, err := url.Parse(trackerURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tracker URL: %w", err)
@@ -20,9 +20,9 @@ func GetPeersFromTracker(trackerURL string, infoHash [20]byte) ([]net.TCPAddr, e
 
 	switch u.Scheme {
 	case "http", "https":
-		return getPeersFromHTTPTracker(u, infoHash)
+		return getPeersFromHTTPTracker(u, infoHash, peerID, port)
 	case "udp":
-		return getPeersFromUDPTracker(u, infoHash)
+		return getPeersFromUDPTracker(u, infoHash, peerID, port)
 	default:
 		return nil, fmt.Errorf("unrecognized tracker url scheme: %s", u.Scheme)
 	}
@@ -37,8 +37,8 @@ type compactHTTPTrackerResp struct {
 	Peers    string `bencode:"peers"`    // blob of all peer IP addresses & ports
 }
 
-// The original HTTP tracker response was more verbose. It is also a bencoded
-// format that includes
+// The original HTTP tracker response was more verbose. Unfortunately, sometimes
+// HTTP trackers send this format even if we ask for the compact format.
 // http://bittorrent.org/beps/bep_0003.html#trackers
 type originalHTTPTrackerResp struct {
 	Peers []struct {
@@ -55,19 +55,16 @@ type originalHTTPTrackerResp struct {
 	Event      string `bencode:"event"`
 }
 
-// todo update to build from infohash and peer id if needed
-func getPeersFromHTTPTracker(u *url.URL, infoHash [20]byte) ([]net.TCPAddr, error) {
+func getPeersFromHTTPTracker(u *url.URL, infoHash, peerID [20]byte, port int) ([]net.TCPAddr, error) {
 	v := url.Values{}
 	v.Add("info_hash", string(infoHash[:]))
 	// my peer_id (just random). Real bittorrent clients would identify software and version
-	peerID := make([]byte, 20)
-	rand.Read(peerID)
 	v.Add("peer_id", string(peerID[:]))
-	v.Add("port", "6881")
+	v.Add("port", strconv.Itoa(port))
 	v.Add("uploaded", "0")
 	v.Add("downloaded", "0")
 	v.Add("compact", "1") // BEP0023: compact peer list
-	v.Add("left", "0")
+	v.Add("left", "0")    // just say zero, if source is a magnet link we wouldn't know anyways
 
 	// set url query params
 	u.RawQuery = v.Encode()
@@ -89,32 +86,24 @@ func getPeersFromHTTPTracker(u *url.URL, infoHash [20]byte) ([]net.TCPAddr, erro
 	}
 
 	// parse as compact format
-	var trackerResp compactHTTPTrackerResp
-	errCompact := bencode.DecodeBytes(raw, &trackerResp)
+	var compactResp compactHTTPTrackerResp
+	err = bencode.DecodeBytes(raw, &compactResp)
 
-	// parse as original format
-	var ogTrackerResp originalHTTPTrackerResp
-	errOriginal := bencode.DecodeBytes(raw, &ogTrackerResp)
-	if errCompact != nil && errOriginal != nil {
-		return nil, fmt.Errorf("malformed http tracker response, did not match compact (%w) OR original format (%w)", errCompact, errOriginal)
-	}
-
-	var addrs []net.TCPAddr
-
-	// the rare `if err == nil`
-	if errCompact == nil {
+	// the rare `if err == nil`, then response is in (the preferred) compact format
+	if err == nil {
+		var addrs []net.TCPAddr
 		const peerSize = 6 // 4 bytes for IP, 2 for Port
-		if len(trackerResp.Peers)%peerSize != 0 {
+		if len(compactResp.Peers)%peerSize != 0 {
 			return nil, fmt.Errorf("malformed http tracker response: %w", err)
 		}
 
-		for i := 0; i < len(trackerResp.Peers); i += peerSize {
+		for i := 0; i < len(compactResp.Peers); i += peerSize {
 			// convert port substring into byte slice to calculate via BigEndian
-			portRaw := []byte(trackerResp.Peers[i+4 : i+6])
+			portRaw := []byte(compactResp.Peers[i+4 : i+6])
 			port := binary.BigEndian.Uint16(portRaw)
 
 			addrs = append(addrs, net.TCPAddr{
-				IP:   []byte(trackerResp.Peers[i : i+4]),
+				IP:   []byte(compactResp.Peers[i : i+4]),
 				Port: int(port),
 			})
 		}
@@ -122,8 +111,15 @@ func getPeersFromHTTPTracker(u *url.URL, infoHash [20]byte) ([]net.TCPAddr, erro
 		return addrs, nil
 	}
 
-	// otherwise parse original tracker response
-	for _, p := range ogTrackerResp.Peers {
+	// parse as original format
+	var originalResp originalHTTPTrackerResp
+	err = bencode.DecodeBytes(raw, &originalResp)
+	if err != nil {
+		return nil, fmt.Errorf("malformed http tracker response, not compact or original format: %w", err)
+	}
+
+	var addrs []net.TCPAddr
+	for _, p := range originalResp.Peers {
 		// assume ipv4 and not domain names. otherwise need to use net.LookupIP?
 		addrs = append(addrs, net.TCPAddr{
 			IP:   net.ParseIP(p.IP),
@@ -134,14 +130,16 @@ func getPeersFromHTTPTracker(u *url.URL, infoHash [20]byte) ([]net.TCPAddr, erro
 	return addrs, nil
 }
 
-func getPeersFromUDPTracker(u *url.URL, infoHash [20]byte) ([]net.TCPAddr, error) {
-	udpClient, err := NewUDPTrackerClient(u, infoHash)
+func getPeersFromUDPTracker(u *url.URL, infoHash, peerID [20]byte, port int) ([]net.TCPAddr, error) {
+	udpClient, err := NewUDPTrackerClient(u, infoHash, peerID, port)
 	if err != nil {
 		return nil, err
 	}
 	return udpClient.GetPeers()
 }
 
+// DedupeAddrs is a helper function to dedupe all the peer addresses received
+// from multiple tracker servers
 func DedupeAddrs(addrs []net.TCPAddr) []net.TCPAddr {
 	deduped := []net.TCPAddr{}
 	set := map[string]bool{}

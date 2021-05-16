@@ -17,11 +17,11 @@ Initially based off of a [blog post][jl-blog-post] from Jesse Li to implement th
 ## TODO
 - [ ] Implement 'endgame mode' as described in [BEP0003][] for downloading the last few pieces
 - [ ] Seeding in OG .torrent protocol
-- [ ] Magnet links - might go w/ udp trackers
-    - [ ] UDP Trackers ([BEP0015][])
+- [x] Magnet links - might go w/ udp trackers
+    - [x] UDP Trackers ([BEP0015][])
         - can acquire a list of peers (ip & port) from a UDP tracker url
     - [ ] UDP Extensions ([BEP0041][])
-    - [ ] Extension to download metadata from peers ([BEP0009][])
+    - [x] Extension to download metadata from peers ([BEP0009][])
 - [ ] DHT
 - [ ] PEX
 - [ ] Announce list - i.e. Multitracker Metadata Extension ([BEP0012])
