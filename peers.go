@@ -55,14 +55,17 @@ func NewPeerClient(peerAddr net.TCPAddr, infoHash, peerID [20]byte) (*PeerClient
 		}
 	}
 
-	// receive bitfield message
-	cli.conn.SetDeadline(time.Now().Add(time.Second * 3))
-	_, err = cli.receiveMessage()
-	if err != nil {
-		return nil, fmt.Errorf("receiving bitfield message: %w", err)
-	}
+	// receive bitfield message IF it hasn't been received already, some clients
+	// will have sent it before the extended handshake
 	if len(cli.bitfield) == 0 {
-		return nil, fmt.Errorf("bitfield not set")
+		cli.conn.SetDeadline(time.Now().Add(time.Second * 3))
+		_, err = cli.receiveMessage()
+		if err != nil {
+			return nil, fmt.Errorf("receiving bitfield message: %w", err)
+		}
+		if len(cli.bitfield) == 0 {
+			return nil, fmt.Errorf("bitfield not set")
+		}
 	}
 
 	// send unchoke and interested message so the peer is ready for requests

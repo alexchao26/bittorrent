@@ -12,6 +12,8 @@ import (
 	"github.com/zeebo/bencode"
 )
 
+// GetPeersFromTracker will attempt to get peers from a http/s or udp tracker
+// server for the given infohash.
 func GetPeersFromTracker(trackerURL string, infoHash, peerID [20]byte, port int) ([]net.TCPAddr, error) {
 	u, err := url.Parse(trackerURL)
 	if err != nil {
@@ -69,6 +71,7 @@ func getPeersFromHTTPTracker(u *url.URL, infoHash, peerID [20]byte, port int) ([
 	// set url query params
 	u.RawQuery = v.Encode()
 
+	// todo make an http.Client with a timeout
 	resp, err := http.Get(u.String())
 	if err != nil {
 		return nil, fmt.Errorf("sending get req to http tracker: %w", err)

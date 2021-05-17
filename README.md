@@ -24,7 +24,7 @@ Initially based off of a [blog post][jl-blog-post] from Jesse Li to implement th
     - [x] Extension to download metadata from peers ([BEP0009][])
 - [ ] DHT
 - [ ] PEX
-- [ ] Announce list - i.e. Multitracker Metadata Extension ([BEP0012])
+- [x] Announce list - i.e. Multitracker Metadata Extension ([BEP0012])
 - [ ] Some pretty terminal visual of pieces being downloaded?
 
 <!-- reference links -->

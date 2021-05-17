@@ -28,6 +28,17 @@ func (p *PeerClient) receiveExtendedHandshake() error {
 		return fmt.Errorf("reading extension handshake length: %w", err)
 	}
 
+	// Allow three read retires if a non-extended message is received. Some clients will send
+	// bitfield, unchoke, or have before the extended handshake message which doesn't need to be
+	// handled as an error.
+	for i := 0; i < 3 && messageID(msg.id) != msgExtended; i++ {
+		lastMsgID := messageID(msg.id)
+		msg, err = p.receiveMessage()
+		if err != nil {
+			return fmt.Errorf("retrying extended handshake after %s message: %w", lastMsgID, err)
+		}
+	}
+
 	if messageID(msg.id) != msgExtended {
 		return fmt.Errorf("expected extended message, got %s", messageID(msg.id))
 	}

@@ -20,7 +20,7 @@ import (
 // The 20 byte SHA1 hashes are formatted into a slice of 20-byte arrays for easy
 // comparison with pieces downloaded from a peer
 type TorrentFile struct {
-	Announce    string     // a url to get peers from
+	TrackerURLs []string   // tracker URLs: combined announce-list & announce
 	InfoHash    [20]byte   // SHA-1 hash of entire torrent file's Info field
 	PieceHashes [][20]byte // individual SHA-1 hashes of each file piece
 	PieceLength int        // number of bytes of each piece
@@ -86,7 +86,8 @@ func FromMetadataBytes(raw []byte) (TorrentFile, error) {
 // it is not immediately usable, so it can be converted to a TorrentFile struct
 type bencodeTorrent struct {
 	// URL of tracker server to get peers from
-	Announce string `bencode:"announce"`
+	Announce     string     `bencode:"announce"`
+	AnnounceList [][]string `bencode:"announce-list"`
 	// Info is parsed as a RawMessage to ensure that the final info_hash is
 	// correct even in the case of the info dictionary being an unexpected shape
 	Info bencode.RawMessage `bencode:"info"`
@@ -110,6 +111,15 @@ type bencodeInfo struct {
 func toTorrentFile(btor bencodeTorrent, info bencodeInfo) (TorrentFile, error) {
 	// SHA-1 hash the entire info dictionary to get the info_hash
 	infoHash := sha1.Sum(btor.Info)
+
+	var trackerURLs []string
+	for _, list := range btor.AnnounceList {
+		trackerURLs = append(trackerURLs, list...)
+	}
+	// BEP0012, only use `announce` if `announce-list` is not present
+	if len(trackerURLs) == 0 {
+		trackerURLs = append(trackerURLs, btor.Announce)
+	}
 
 	// split the Pieces blob into the 20-byte SHA-1 hashes for comparison later
 	const hashLen = 20 // length of a SHA-1 hash
@@ -149,7 +159,7 @@ func toTorrentFile(btor bencodeTorrent, info bencodeInfo) (TorrentFile, error) {
 	}
 
 	return TorrentFile{
-		Announce:    btor.Announce,
+		TrackerURLs: trackerURLs,
 		InfoHash:    infoHash,
 		PieceHashes: pieceHashes,
 		PieceLength: info.PieceLength,

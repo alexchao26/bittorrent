@@ -34,68 +34,86 @@ func main() {
 		panic("updating rlimit: " + err.Error())
 	}
 
-	// Two things we need to start the download
 	var torrent TorrentFile
-	var peerClients []*PeerClient
-	var mut sync.Mutex
-
-	// peerID is generated randomly
-	peerID := [20]byte{}
-	rand.Read(peerID[:])
-	// doesn't really matter for just leeching
-	port := 6881
-
+	var infoHash [20]byte
+	var trackerURLs []string
+	// parse off the intohash and tracker urls
 	if strings.HasPrefix(*source, "magnet") {
 		magnetLink, err := ParseMagnetLink(*source)
 		if err != nil {
 			panic("error parsing magnet link: " + err.Error())
 		}
-
-		var peerAddrs []net.TCPAddr
-		var wg sync.WaitGroup
-		wg.Add(len(magnetLink.TrackerURLs))
-		for _, trackerURL := range magnetLink.TrackerURLs {
-			trackerURL := trackerURL
-			go func() {
-				defer wg.Done()
-				addrs, err := GetPeersFromTracker(trackerURL, magnetLink.InfoHash, peerID, port)
-				if err != nil {
-					fmt.Printf("error from tracker %s: %s\n", trackerURL, err.Error())
-					return
-				}
-				mut.Lock()
-				fmt.Printf("peers from %s: %d\n", trackerURL, len(addrs))
-				peerAddrs = append(peerAddrs, addrs...)
-				mut.Unlock()
-			}()
+		trackerURLs = magnetLink.TrackerURLs
+		infoHash = magnetLink.InfoHash
+	} else if strings.HasSuffix(*source, ".torrent") {
+		var err error
+		torrent, err = ParseTorrentFile(*source)
+		if err != nil {
+			panic(err)
 		}
-		wg.Wait()
 
-		peerAddrs = DedupeAddrs(peerAddrs)
+		trackerURLs = torrent.TrackerURLs
+		infoHash = torrent.InfoHash
+	}
 
-		wg.Add(len(peerAddrs))
-		for _, addr := range peerAddrs {
-			addr := addr
-			go func() {
-				defer wg.Done()
-				cli, err := NewPeerClient(addr, magnetLink.InfoHash, peerID)
-				if err != nil {
-					fmt.Printf("error connecting to peer at %s: %s\n", addr.String(), err.Error())
-					return
-				}
-				mut.Lock()
-				peerClients = append(peerClients, cli)
-				mut.Unlock()
-			}()
-		}
-		wg.Wait()
+	// peerID is generated randomly
+	var peerID [20]byte
+	rand.Read(peerID[:])
+	// port doesn't matter for leeching
+	port := 6881
 
-		fmt.Println("total peer count:", len(peerClients))
+	var peerAddrs []net.TCPAddr
+	var wg sync.WaitGroup
+	var mut sync.Mutex
 
+	// get peer addresses from all trackers
+	wg.Add(len(trackerURLs))
+	for _, trackerURL := range trackerURLs {
+		trackerURL := trackerURL
+		go func() {
+			defer wg.Done()
+			addrs, err := GetPeersFromTracker(trackerURL, infoHash, peerID, port)
+			if err != nil {
+				fmt.Printf("error from tracker %s: %s\n", trackerURL, err.Error())
+				return
+			}
+			mut.Lock()
+			fmt.Printf("peers from %s: %d\n", trackerURL, len(addrs))
+			peerAddrs = append(peerAddrs, addrs...)
+			mut.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	peerAddrs = DedupeAddrs(peerAddrs)
+
+	// create all peer clients
+	var peerClients []*PeerClient
+	wg.Add(len(peerAddrs))
+	for _, addr := range peerAddrs {
+		addr := addr
+		go func() {
+			defer wg.Done()
+			cli, err := NewPeerClient(addr, infoHash, peerID)
+			if err != nil {
+				fmt.Printf("error connecting to peer at %s: %s\n", addr.String(), err.Error())
+				return
+			}
+			mut.Lock()
+			peerClients = append(peerClients, cli)
+			mut.Unlock()
+		}()
+	}
+	wg.Wait()
+
+	fmt.Println("total peer count:", len(peerClients))
+
+	// get metadata if the source was a magnet link
+	if strings.HasPrefix(*source, "magnet") {
 		// getting metadata is fast enough that going to peers serially is fine
 		var metadataBytes []byte
 		for _, cli := range peerClients {
-			metadataBytes, err = cli.GetMetadata(magnetLink.InfoHash)
+			metadataBytes, err = cli.GetMetadata(infoHash)
 			if err != nil {
 				fmt.Printf("error getting metadata from %s: %s\n", cli.conn.RemoteAddr(), err)
 			}
@@ -112,43 +130,9 @@ func main() {
 		if err != nil {
 			panic("parsing metadata bytes: " + err.Error())
 		}
-	} else if strings.HasSuffix(*source, ".torrent") {
-		var err error
-		torrent, err = ParseTorrentFile(*source)
-		if err != nil {
-			panic(err)
-		}
-
-		peerAddrs, err := GetPeersFromTracker(torrent.Announce, torrent.InfoHash, peerID, port)
-		if err != nil {
-			panic(err)
-		}
-
-		if len(peerAddrs) == 0 {
-			panic("no peers!")
-		}
-
-		var wg sync.WaitGroup
-		for _, addr := range peerAddrs {
-			// spin up peer clients concurrently
-			addr := addr
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				client, err := NewPeerClient(addr, torrent.InfoHash, peerID)
-				if err != nil {
-					fmt.Println("error connecting to", addr, err)
-					return
-				}
-				mut.Lock()
-				peerClients = append(peerClients, client)
-				mut.Unlock()
-			}()
-		}
-		wg.Wait()
-
-		fmt.Println("total peer count:", len(peerClients))
 	}
+
+	// Ready to start p2p downloads
 
 	// make job queue size the number of pieces, otherwise writing to an unbuffered channel will
 	// block until "someone" reads that value
@@ -160,6 +144,7 @@ func main() {
 		p := p
 		go func() {
 			// start "worker", i.e. client listening for jobs
+			// todo remove concurrency from peer client and move it to the caller, eventually will become Download struct at root of project
 			p.ListenForJobs(jobQueue, results)
 		}()
 	}
