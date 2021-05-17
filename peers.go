@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -29,7 +28,7 @@ type PeerClient struct {
 //   - receives the bitfield message
 //   - sends an unchoke and interested message to the peer
 func NewPeerClient(peerAddr net.TCPAddr, infoHash, peerID [20]byte) (*PeerClient, error) {
-	conn, err := net.DialTimeout("tcp", peerAddr.String(), 5*time.Second)
+	conn, err := net.DialTimeout("tcp", peerAddr.String(), 3*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("dialing: %w", err)
 	}
@@ -262,12 +261,13 @@ func (p *PeerClient) ListenForJobs(jobQueue chan *Job, results chan<- *Piece) er
 }
 
 // messageID are the types of messages that can be sent
-type messageID int
+// One drawback of using an iota is that msgChoke is the zero value. This
+// doesn't cause any major issues in this project, but msgUnknown is provided as
+// a drop-in for zero-value where needed.
+type messageID uint8
 
-// todo this is a bad usecase for iota because the zero value is a valid type (msgChoke) change to a typed string
 const (
-	msgKeepAlive messageID = iota - 1
-	msgChoke
+	msgChoke messageID = iota
 	msgUnchoke
 	msgInterested
 	msgNotInterested
@@ -278,6 +278,10 @@ const (
 	msgCancel
 
 	msgExtended messageID = 20 // BEP0010: Bittorrent protocol extension messages
+
+	// additional message ids
+	msgKeepAlive messageID = 254
+	msgUnknown   messageID = 255 // provided for zero value in place of msgChoke
 )
 
 var messageIDStrings = map[messageID]string{
@@ -291,6 +295,8 @@ var messageIDStrings = map[messageID]string{
 	msgPiece:         "piece",
 	msgCancel:        "cancel",
 	msgExtended:      "extended",
+	msgKeepAlive:     "keep alive",
+	msgUnknown:       "unknown",
 }
 
 func (m messageID) String() string {
@@ -298,14 +304,16 @@ func (m messageID) String() string {
 }
 
 // sendMessage serializes and sends a message id and payload to the peer
-//
-// Note: KeepAlive messages are not implemented
 func (p *PeerClient) sendMessage(id messageID, payload []byte) error {
 	length := uint32(len(payload) + 1) // +1 for ID
 	message := make([]byte, length+4)  // + 4 to fit <length> at start of message
 	binary.BigEndian.PutUint32(message[0:4], length)
 	message[4] = byte(id)
-	copy(message[5:], payload)
+
+	// add in payload if not a keep alive message
+	if id != msgKeepAlive {
+		copy(message[5:], payload)
+	}
 
 	_, err := p.conn.Write(message)
 	if err != nil {
@@ -324,69 +332,50 @@ type message struct {
 // Processing a message can change the state of the peer (choked/unchoked,
 // its bitmap).
 //
-// A non-zero value message is only returned for messages that require further
-// handling based on the caller i.e. piece and extended messages
+// The parsed message is also returned for further processing by the caller,
+// e.g. for processing piece or extended metadata requests
 func (p *PeerClient) receiveMessage() (message, error) {
 	// Receive and parse the message <length><id><payload>
 	// 4 bytes that represent the length of the rest of the message
 	lengthBuf := make([]byte, 4)
 	_, err := io.ReadFull(p.conn, lengthBuf)
 	if err != nil {
-		return message{}, fmt.Errorf("reading message length: %w", err)
+		return message{id: msgUnknown}, fmt.Errorf("reading message length: %w", err)
 	}
 
-	messageLength := binary.BigEndian.Uint32(lengthBuf)
-	if messageLength == 0 {
+	msgLength := binary.BigEndian.Uint32(lengthBuf)
+	if msgLength == 0 {
 		// keep-alive message
 		return message{id: msgKeepAlive}, nil
 	}
 
 	// buffer to contain the rest of the message, 1 byte for the messageID, the
 	// rest for the payload
-	messageBuf := make([]byte, messageLength)
+	messageBuf := make([]byte, msgLength)
 	_, err = io.ReadFull(p.conn, messageBuf)
 	if err != nil {
-		return message{}, fmt.Errorf("reading message payload: %w", err)
+		return message{id: msgUnknown}, fmt.Errorf("reading message payload: %w", err)
 	}
-	messageID := messageID(messageBuf[0])
+	msgID := messageID(messageBuf[0])
 	messagePayload := messageBuf[1:]
 
-	// Process the message
-	switch messageID {
+	// apply side effects to client if applicable
+	switch msgID {
 	case msgChoke:
 		p.isChoked = true
 	case msgUnchoke:
 		p.isChoked = false
-	case msgInterested:
-		// not implemented, purely leeching
-	case msgNotInterested:
-		// not implemented, purely leeching
 	case msgHave:
 		index := binary.BigEndian.Uint32(messagePayload)
 		p.bitfield.setPiece(int(index))
 	case msgBitfield:
 		p.bitfield = bitfield(messagePayload)
-	case msgRequest:
-		// not implemented, purely leeching
-	case msgPiece:
-		return message{
-			id:      msgPiece,
-			payload: messagePayload,
-		}, nil
-	case msgCancel:
-		// a leech shouldn't receive a cancel message, so error out here
-		return message{}, errors.New("received CANCEL")
-	case msgExtended:
-		return message{
-			id:      msgExtended,
-			payload: messagePayload,
-		}, nil
-	default:
-		return message{}, fmt.Errorf("received unrecognized message type: %s", messageID.String())
 	}
 
-	// todo currently this returns a message with id msgChoke b/c that's the zero value. Fix along with removing iotas
-	return message{}, nil
+	return message{
+		id:      msgID,
+		payload: messagePayload,
+	}, nil
 }
 
 // bitfield communicates which pieces a peer has and can send us

@@ -10,25 +10,24 @@ import (
 	"time"
 )
 
-type Action uint32
+type MessageAction uint32
 
-// todo this is a bad usecase for iota because the zero value is a valid type (connectAction) change to a typed string
 const (
-	ConnectAction Action = iota
+	ConnectAction MessageAction = iota
 	AnnounceAction
 	ScrapeAction
 	ErrorAction
 )
 
-var actionStrings = map[Action]string{
+var actionStrings = map[MessageAction]string{
 	ConnectAction:  "connect",
 	AnnounceAction: "announce",
 	ScrapeAction:   "scrape",
 	ErrorAction:    "error",
 }
 
-func (a Action) String() string {
-	return actionStrings[a]
+func (m MessageAction) String() string {
+	return actionStrings[m]
 }
 
 type UDPTrackerClient struct {
@@ -176,12 +175,12 @@ func (u *UDPTrackerClient) announce() error {
 }
 
 // scrape gets data on the torrent including seeders, completed and leechers.
-// I'm not sure if it's necessary to use for a client... Once I get all peers
-// from `announce` I feel like I'm good to go?
 //
 // This implementation is limited to scraping data of a SINGLE torrent
 //
-// Currently scrape is unused and this implementation only returns an error
+// Currently scrape is unused because a bittorrent client doesn't need to get
+// any additional stats once it gets peer addresses from the Announce message.
+//lint:ignore U1000 unused but included for completion
 func (u *UDPTrackerClient) scrape() error {
 	transactionID := rand.Uint32()
 	scrapeMsg := make([]byte, 36)
@@ -225,7 +224,7 @@ func (u *UDPTrackerClient) scrape() error {
 //
 // If there is no error it returns the rest of the response (index 8 to the end)
 // for the caller to handle.
-func (u *UDPTrackerClient) parseUDPResponse(wantTransactionID uint32, wantAction Action, resp []byte) ([]byte, error) {
+func (u *UDPTrackerClient) parseUDPResponse(wantTransactionID uint32, wantAction MessageAction, resp []byte) ([]byte, error) {
 	if len(resp) < 8 {
 		return nil, fmt.Errorf("response is <8 characters, got %d", len(resp))
 	}
@@ -236,13 +235,13 @@ func (u *UDPTrackerClient) parseUDPResponse(wantTransactionID uint32, wantAction
 	}
 
 	action := binary.BigEndian.Uint32(resp[0:4])
-	if Action(action) == ErrorAction {
+	if MessageAction(action) == ErrorAction {
 		// return an error that includes the message
 		errorText := string(resp[8:])
 		return nil, fmt.Errorf("error response: %s", errorText)
 	}
-	if Action(action) != wantAction {
-		return nil, fmt.Errorf("want %s action, got %s", wantAction, Action(action))
+	if MessageAction(action) != wantAction {
+		return nil, fmt.Errorf("want %s action, got %s", wantAction, MessageAction(action))
 	}
 
 	return resp[8:], nil

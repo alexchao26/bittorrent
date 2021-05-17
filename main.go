@@ -51,8 +51,6 @@ func main() {
 			panic("error parsing magnet link: " + err.Error())
 		}
 
-		fmt.Println("Parsed Magnet Link", magnetLink)
-
 		var peerAddrs []net.TCPAddr
 		var wg sync.WaitGroup
 		wg.Add(len(magnetLink.TrackerURLs))
@@ -62,11 +60,11 @@ func main() {
 				defer wg.Done()
 				addrs, err := GetPeersFromTracker(trackerURL, magnetLink.InfoHash, peerID, port)
 				if err != nil {
-					fmt.Printf("error from tracker %q: %s\n", trackerURL, err.Error())
+					fmt.Printf("error from tracker %s: %s\n", trackerURL, err.Error())
 					return
 				}
 				mut.Lock()
-				fmt.Println("\t\tpeers from ", trackerURL, ": ", len(addrs))
+				fmt.Printf("peers from %s: %d\n", trackerURL, len(addrs))
 				peerAddrs = append(peerAddrs, addrs...)
 				mut.Unlock()
 			}()
@@ -74,9 +72,7 @@ func main() {
 		wg.Wait()
 
 		peerAddrs = DedupeAddrs(peerAddrs)
-		fmt.Println("deduped peer count:", len(peerAddrs))
 
-		var metadataBytes []byte
 		wg.Add(len(peerAddrs))
 		for _, addr := range peerAddrs {
 			addr := addr
@@ -84,7 +80,7 @@ func main() {
 				defer wg.Done()
 				cli, err := NewPeerClient(addr, magnetLink.InfoHash, peerID)
 				if err != nil {
-					fmt.Println("error creating client to", addr, err)
+					fmt.Printf("error connecting to peer at %s: %s\n", addr.String(), err.Error())
 					return
 				}
 				mut.Lock()
@@ -94,20 +90,19 @@ func main() {
 		}
 		wg.Wait()
 
-		fmt.Println("peer clients len", len(peerClients))
+		fmt.Println("total peer count:", len(peerClients))
 
+		// getting metadata is fast enough that going to peers serially is fine
+		var metadataBytes []byte
 		for _, cli := range peerClients {
-			fmt.Println("start getting from", cli.conn.RemoteAddr())
 			metadataBytes, err = cli.GetMetadata(magnetLink.InfoHash)
 			if err != nil {
-				fmt.Println("ERROR cli.GetMetadata() ", err)
+				fmt.Printf("error getting metadata from %s: %s\n", cli.conn.RemoteAddr(), err)
 			}
 			if err == nil {
 				break
 			}
 		}
-
-		fmt.Println("metadata bytes len", len(metadataBytes))
 
 		if len(metadataBytes) == 0 {
 			panic("failed getting metadata from clients")
@@ -128,22 +123,21 @@ func main() {
 		if err != nil {
 			panic(err)
 		}
-		fmt.Println("Peers:", len(peerAddrs))
 
 		if len(peerAddrs) == 0 {
 			panic("no peers!")
 		}
 
 		var wg sync.WaitGroup
-		for _, ip := range peerAddrs {
+		for _, addr := range peerAddrs {
 			// spin up peer clients concurrently
-			ip := ip
+			addr := addr
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				client, err := NewPeerClient(ip, torrent.InfoHash, peerID)
+				client, err := NewPeerClient(addr, torrent.InfoHash, peerID)
 				if err != nil {
-					fmt.Println("error connecting to", ip, err)
+					fmt.Println("error connecting to", addr, err)
 					return
 				}
 				mut.Lock()
@@ -152,10 +146,12 @@ func main() {
 			}()
 		}
 		wg.Wait()
+
+		fmt.Println("total peer count:", len(peerClients))
 	}
 
-	// make job queue size the number of pieces, otherwise unbuffered channels
-	// block until "someone" reads each written value off the channel
+	// make job queue size the number of pieces, otherwise writing to an unbuffered channel will
+	// block until "someone" reads that value
 	jobQueue := make(chan *Job, len(torrent.PieceHashes))
 	results := make(chan *Piece)
 
