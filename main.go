@@ -5,6 +5,7 @@ import (
 	"crypto/md5"
 	"crypto/rand"
 	"crypto/sha1"
+	"errors"
 	"flag"
 	"fmt"
 	"net"
@@ -134,18 +135,48 @@ func main() {
 
 	// Ready to start p2p downloads
 
+	// pieceJob includes metadata on a single piece to be downloaded
+	type pieceJob struct {
+		index  int
+		length int
+		hash   [20]byte
+	}
+
+	// pieceResult contains the downloaded piece bytes and its index
+	type pieceResult struct {
+		Index     int
+		FilePiece []byte
+	}
+
 	// make job queue size the number of pieces, otherwise writing to an unbuffered channel will
 	// block until "someone" reads that value
-	jobQueue := make(chan *Job, len(torrent.PieceHashes))
-	results := make(chan *Piece)
+	jobQueue := make(chan pieceJob, len(torrent.PieceHashes))
+	results := make(chan pieceResult)
 
 	// spin up clients concurrently
 	for _, p := range peerClients {
 		p := p
+		// start "worker" goroutine, i.e. peer client ready to download pieces
 		go func() {
-			// start "worker", i.e. client listening for jobs
-			// todo remove concurrency from peer client and move it to the caller, eventually will become Download struct at root of project
-			p.ListenForJobs(jobQueue, results)
+			defer p.Close()
+			for job := range jobQueue {
+				pieceBuf, err := p.GetPiece(job.index, job.length, job.hash)
+				if err != nil {
+					// place job back on queue
+					jobQueue <- job
+					// if the client didn't have the piece, just continue along, don't close the
+					// peer connection
+					if errors.Is(err, ErrNotInBitfield) {
+						continue
+					}
+					// otherwise stop listening to jobQueue, defer will cleanup client connection
+					return
+				}
+				results <- pieceResult{
+					Index:     job.index,
+					FilePiece: pieceBuf,
+				}
+			}
 		}()
 	}
 
@@ -156,10 +187,10 @@ func main() {
 		if i == len(torrent.PieceHashes)-1 {
 			length = torrent.TotalLength - torrent.PieceLength*(len(torrent.PieceHashes)-1)
 		}
-		jobQueue <- &Job{
-			Index:  i,
-			Length: length,
-			Hash:   hash,
+		jobQueue <- pieceJob{
+			index:  i,
+			length: length,
+			hash:   hash,
 		}
 	}
 

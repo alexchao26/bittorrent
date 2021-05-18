@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"crypto/sha1"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -144,123 +145,100 @@ func (p *PeerClient) handshake(infoHash, peerID [20]byte) error {
 	return nil
 }
 
-// Job contains info needed to download a piece from a peer
-type Job struct {
-	Index  int
-	Length int
-	Hash   [20]byte
+// Close the underlying peer connection
+func (p *PeerClient) Close() error {
+	return p.conn.Close()
 }
 
-// Piece contains info to place a downloaded piece into its final location
-// amongst the downloaded file(s), namely the piece itself and its index
-type Piece struct {
-	Index     int
-	FilePiece []byte
-}
+var ErrNotInBitfield = errors.New("client does not have piece")
 
-func (p *PeerClient) ListenForJobs(jobQueue chan *Job, results chan<- *Piece) error {
-	defer p.conn.Close()
+// GetPiece starts a download for the specified piece. If the returned error is
+// non-nil and not ErrNotInBitfield, the peer can be considered "bad" and can be
+// disconnected from
+func (p *PeerClient) GetPiece(index, length int, hash [20]byte) ([]byte, error) {
+	if !p.bitfield.hasPiece(index) {
+		// return a package level error so callers know not to disconnect from this peer
+		return nil, ErrNotInBitfield
+	}
 
-	// receive jobs off the job queue channel
-	// in any situation where the peer cannot or fails to send us a piece, return the job to the
-	// queue (and in likely unrecoverable circumstances, disconnect from the peer)
-	for job := range jobQueue {
-		if !p.bitfield.hasPiece(job.Index) {
-			jobQueue <- job
+	// set a deadline so a stuck peer relinquishes this job
+	p.conn.SetDeadline(time.Now().Add(time.Second * 15))
+	defer p.conn.SetDeadline(time.Time{})
+
+	const maxBlockSize = 16384
+	const maxBacklog = 10
+
+	var requested, received, backlog int
+	pieceBuf := make([]byte, length)
+	for received < length {
+		// create backlog
+		for !p.isChoked && backlog < maxBacklog && requested < length {
+			// request message format: <index, uint32><begin, uint32><request_size, uint32>
+			// where begin is the offset for this piece, i.e. the total requested so far b/c
+			// blocks are downloaded sequentially
+			payload := make([]byte, 12)
+			binary.BigEndian.PutUint32(payload[0:4], uint32(index))
+			binary.BigEndian.PutUint32(payload[4:8], uint32(requested))
+			// the final block may be truncated
+			blockSize := maxBlockSize
+			if requested+blockSize > length {
+				blockSize = length - requested
+			}
+			binary.BigEndian.PutUint32(payload[8:12], uint32(blockSize))
+
+			err := p.sendMessage(msgRequest, payload)
+			if err != nil {
+				return nil, fmt.Errorf("sending request message to create backlog: %w", err)
+			}
+			requested += blockSize
+			backlog++
+		}
+		if p.isChoked {
+			err := p.sendMessage(msgUnchoke, nil)
+			if err != nil {
+				return nil, fmt.Errorf("sending unchoke: %w", err)
+			}
+		}
+
+		msg, err := p.receiveMessage()
+		if err != nil {
+			return nil, fmt.Errorf("receiving piece message from peer: %w", err)
+		}
+		if msg.id != msgPiece {
+			continue
+		}
+		// piece format: <index, uint32><begin offset, uint32><data []byte>
+		respIndex := binary.BigEndian.Uint32(msg.payload[0:4])
+		if respIndex != uint32(index) {
+			// possible for a client to send the "wrong" piece, just ignore it
 			continue
 		}
 
-		var requested, received, backlog int
-		pieceBuf := make([]byte, job.Length)
+		begin := binary.BigEndian.Uint32(msg.payload[4:8])
+		blockData := msg.payload[8:]
+		// copy the block/data into the piece buffer
+		n := copy(pieceBuf[begin:], blockData[:])
 
-		// set a deadline so a stuck client puts its job back on the queue
-		p.conn.SetDeadline(time.Now().Add(time.Second * 15))
-
-		const maxBlockSize = 16384
-		// how many unfulfilled requests to have at one time
-		const maxBacklog = 10
-
-		for received < job.Length {
-			// create backlog
-			for !p.isChoked && backlog < maxBacklog && requested < job.Length {
-				// request message format: <index, uint32><begin, uint32><request_size, uint32>
-				// where begin is the offset for this piece, i.e. the total requested so far b/c
-				// blocks are downloaded sequentially
-				payload := make([]byte, 12)
-				binary.BigEndian.PutUint32(payload[0:4], uint32(job.Index))
-				binary.BigEndian.PutUint32(payload[4:8], uint32(requested))
-				// the final block may be truncated
-				blockSize := maxBlockSize
-				if requested+blockSize > job.Length {
-					blockSize = job.Length - requested
-				}
-				binary.BigEndian.PutUint32(payload[8:12], uint32(blockSize))
-
-				err := p.sendMessage(msgRequest, payload)
-				if err != nil {
-					jobQueue <- job
-					return fmt.Errorf("sending request message to create backlog: %w", err)
-				}
-				requested += blockSize
-				backlog++
-			}
-			if p.isChoked {
-				err := p.sendMessage(msgUnchoke, nil)
-				if err != nil {
-					return fmt.Errorf("sending unchoke: %w", err)
-				}
-			}
-
-			msg, err := p.receiveMessage()
-			if err != nil {
-				// if there was an error, kill this peer
-				jobQueue <- job
-				return fmt.Errorf("receiving message from %s: %w", p.conn.RemoteAddr(), err)
-			}
-			if msg.id != msgPiece {
-				continue
-			}
-			// piece format: <index, uint32><begin offset, uint32><data []byte>
-			index := binary.BigEndian.Uint32(msg.payload[0:4])
-			if index != uint32(job.Index) {
-				// possible for a client to send the "wrong" piece, just ignore it
-				continue
-			}
-
-			// should error handle against the job's index?
-			begin := binary.BigEndian.Uint32(msg.payload[4:8])
-			blockData := msg.payload[8:]
-			// copy the block/data into the piece buffer
-			n := copy(pieceBuf[begin:], blockData[:])
-
-			// keep track of the number of received bytes and the backlog size
-			received += n
-			if n != 0 {
-				backlog--
-			}
-		}
-
-		// check integrity via SHA-1
-		pieceHash := sha1.Sum(pieceBuf)
-		if !bytes.Equal(pieceHash[:], job.Hash[:]) {
-			jobQueue <- job
-			// disconnect from peer if they give us a bad piece
-			return fmt.Errorf("failed integrity check from %s", p.conn.RemoteAddr())
-		}
-
-		// tell peer we have this piece now
-		havePayload := make([]byte, 4)
-		binary.BigEndian.PutUint32(havePayload, uint32(job.Index))
-		p.sendMessage(msgHave, havePayload) // ignore errors
-
-		// write to the results channel for processing
-		results <- &Piece{
-			Index:     job.Index,
-			FilePiece: pieceBuf,
+		// keep track of the number of received bytes and the backlog size
+		received += n
+		if n != 0 {
+			backlog--
 		}
 	}
 
-	return nil
+	// check integrity via SHA-1
+	pieceHash := sha1.Sum(pieceBuf)
+	if !bytes.Equal(pieceHash[:], hash[:]) {
+		// disconnect from peer if they give us a bad piece
+		return nil, fmt.Errorf("failed integrity check from %s", p.conn.RemoteAddr())
+	}
+
+	// tell peer we have this piece now
+	havePayload := make([]byte, 4)
+	binary.BigEndian.PutUint32(havePayload, uint32(index))
+	p.sendMessage(msgHave, havePayload) // ignore errors
+
+	return pieceBuf, nil
 }
 
 // messageID are the types of messages that can be sent
