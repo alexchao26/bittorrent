@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/binary"
 	"fmt"
 	"io"
@@ -8,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strconv"
+	"time"
 
 	"github.com/zeebo/bencode"
 )
@@ -71,8 +73,14 @@ func getPeersFromHTTPTracker(u *url.URL, infoHash, peerID [20]byte, port int) ([
 	// set url query params
 	u.RawQuery = v.Encode()
 
-	// todo make an http.Client with a timeout
-	resp, err := http.Get(u.String())
+	// context for 3 second timeout of http request
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second*3)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, "GET", u.String(), nil)
+	if err != nil {
+		return nil, fmt.Errorf("making http GET request: %w", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("sending get req to http tracker: %w", err)
 	}
