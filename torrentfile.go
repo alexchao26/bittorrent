@@ -49,13 +49,7 @@ func ParseTorrentFile(filename string) (TorrentFile, error) {
 		return TorrentFile{}, fmt.Errorf("unmarshalling file: %w", err)
 	}
 
-	var info bencodeInfo
-	err = bencode.DecodeBytes(btor.Info, &info)
-	if err != nil {
-		return TorrentFile{}, fmt.Errorf("unmarshalling info dict: %w", err)
-	}
-
-	tf, err := toTorrentFile(btor, info)
+	tf, err := toTorrentFile(btor)
 	if err != nil {
 		return TorrentFile{}, fmt.Errorf("parsing file contents: %w", err)
 	}
@@ -70,11 +64,8 @@ func FromMetadataBytes(raw []byte) (TorrentFile, error) {
 		return TorrentFile{}, fmt.Errorf("decoding metadata bytes: %w", err)
 	}
 
-	tf, err := toTorrentFile(
-		// TODO cleanup toTorrentFile abstraction...
-		bencodeTorrent{
-			Info: raw,
-		}, bInfo)
+	// reuse toTorrentFile by using raw metadata bytes as the raw info field
+	tf, err := toTorrentFile(bencodeTorrent{Info: raw})
 	if err != nil {
 		return TorrentFile{}, fmt.Errorf("building torrent file from bytes: %w", err)
 	}
@@ -108,7 +99,13 @@ type bencodeInfo struct {
 	} `bencode:"files"`
 }
 
-func toTorrentFile(btor bencodeTorrent, info bencodeInfo) (TorrentFile, error) {
+func toTorrentFile(btor bencodeTorrent) (TorrentFile, error) {
+	var info bencodeInfo
+	err := bencode.DecodeBytes(btor.Info, &info)
+	if err != nil {
+		return TorrentFile{}, fmt.Errorf("unmarshalling info dict: %w", err)
+	}
+
 	// SHA-1 hash the entire info dictionary to get the info_hash
 	infoHash := sha1.Sum(btor.Info)
 
