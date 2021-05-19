@@ -24,7 +24,9 @@ Initially based off of a [blog post][jl-blog-post] from Jesse Li to implement th
     - [x] Extension to download metadata from peers ([BEP0009][])
 - [ ] DHT
 - [ ] PEX
+- [ ] Fast Extension ([BEP0006][])
 - [x] Announce list - i.e. Multitracker Metadata Extension ([BEP0012])
+- [ ] uTorrent Transport Protocol ([BEP0029][])
 - [ ] Some pretty terminal visual of pieces being downloaded?
 
 <!-- reference links -->
@@ -38,3 +40,5 @@ Initially based off of a [blog post][jl-blog-post] from Jesse Li to implement th
 [nasa-torrents]: https://academictorrents.com/collection/nasa-datasets 'Archives of NASA torrents'
 [example-nasa-torrent]: https://academictorrents.com/details/059ed25558b4587143db637ac3ca94bebb57d88d
 [BEP0023]: http://bittorrent.org/beps/bep_0023.html 'Compact Peer Lists'
+[BEP0006]: http://bittorrent.org/beps/bep_0006.html 'Fast Extension'
+[BEP0029]: http://bittorrent.org/beps/bep_0029.html 'uTorrent Transport Protocol'
