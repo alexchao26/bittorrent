@@ -1,4 +1,10 @@
-package main
+// Package peer is a client implementation (TCP only) to peers in the swarm.
+//
+// The current implementation supports
+//   - the extension protocol BEP0010
+//   - metadata transfer between peers BEP0009
+//   - DHT Port transfer BEP0005
+package peer
 
 import (
 	"bytes"
@@ -11,7 +17,7 @@ import (
 	"time"
 )
 
-type PeerClient struct {
+type Client struct {
 	conn              net.Conn // TCP connection to peer
 	isChoked          bool
 	bitfield          bitfield    // tracks which pieces the peer says it can send us
@@ -26,18 +32,18 @@ type PeerClient struct {
 	}
 }
 
-// NewPeerClient initializes a connection with a peer, then:
+// NewClient initializes a connection with a peer, then:
 //   - completes the handshake
 //   - completes the extension handshake if applicable
 //   - receives the bitfield message
 //   - sends an unchoke and interested message to the peer
-func NewPeerClient(addr net.TCPAddr, infoHash, peerID [20]byte) (*PeerClient, error) {
+func NewClient(addr net.TCPAddr, infoHash, peerID [20]byte) (*Client, error) {
 	conn, err := net.DialTimeout("tcp", addr.String(), 3*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("dialing: %w", err)
 	}
 
-	cli := &PeerClient{
+	cli := &Client{
 		conn:     conn,
 		addr:     addr,
 		isChoked: true,
@@ -101,7 +107,7 @@ func NewPeerClient(addr net.TCPAddr, infoHash, peerID [20]byte) (*PeerClient, er
 }
 
 // handshake completes the entire handshake process with the underlying peer
-func (p *PeerClient) handshake(infoHash, peerID [20]byte) error {
+func (p *Client) handshake(infoHash, peerID [20]byte) error {
 	const protocol = "BitTorrent protocol"
 	var buf bytes.Buffer
 	buf.WriteByte(byte(len(protocol)))
@@ -167,17 +173,24 @@ func (p *PeerClient) handshake(infoHash, peerID [20]byte) error {
 	return nil
 }
 
+// Addr returns the address (IP and Port) of the remote peer.
+func (p *Client) Addr() net.Addr {
+	return p.conn.RemoteAddr()
+}
+
 // Close the underlying peer connection
-func (p *PeerClient) Close() error {
+func (p *Client) Close() error {
 	return p.conn.Close()
 }
 
+// ErrNotInBitfield is returned on a call to *Client.GetPiece() if the peer does
+// not have the requested piece.
 var ErrNotInBitfield = errors.New("client does not have piece")
 
 // GetPiece starts a download for the specified piece. If the returned error is
 // non-nil and not ErrNotInBitfield, the peer can be considered "bad" and can be
 // disconnected from
-func (p *PeerClient) GetPiece(index, length int, hash [20]byte) ([]byte, error) {
+func (p *Client) GetPiece(index, length int, hash [20]byte) ([]byte, error) {
 	if !p.bitfield.hasPiece(index) {
 		// return a package level error so callers know not to disconnect from this peer
 		return nil, ErrNotInBitfield
@@ -263,11 +276,11 @@ func (p *PeerClient) GetPiece(index, length int, hash [20]byte) ([]byte, error) 
 	return pieceBuf, nil
 }
 
-// DHTAddr returns the UDP address to reach this peer's DHT node (from a PORT
-// message after BitTorrent handshake, BEP0005). It returns a non-nil error if
-// the peer did not provide said port.
+// DHTAddr returns the UDP address to reach this peer's DHT node. The peer
+// should have sent a Port message after the BitTorrent handshake (per BEP0005).
+// If it did not, a non-nil error is returned.
 // http://bittorrent.org/beps/bep_0005.html
-func (p *PeerClient) DHTAddr() (net.UDPAddr, error) {
+func (p *Client) DHTAddr() (net.UDPAddr, error) {
 	if p.dhtPort == 0 {
 		return net.UDPAddr{}, fmt.Errorf("did not provide DHT port")
 	}
@@ -323,7 +336,7 @@ func (m messageID) String() string {
 }
 
 // sendMessage serializes and sends a message id and payload to the peer
-func (p *PeerClient) sendMessage(id messageID, payload []byte) error {
+func (p *Client) sendMessage(id messageID, payload []byte) error {
 	length := uint32(len(payload) + 1) // +1 for ID
 	message := make([]byte, length+4)  // + 4 to fit <length> at start of message
 	binary.BigEndian.PutUint32(message[0:4], length)
@@ -353,7 +366,7 @@ type message struct {
 //
 // The parsed message is also returned for further processing by the caller,
 // e.g. for processing piece or extended metadata requests
-func (p *PeerClient) receiveMessage() (message, error) {
+func (p *Client) receiveMessage() (message, error) {
 	// Receive and parse the message <length><id><payload>
 	// 4 bytes that represent the length of the rest of the message
 	lengthBuf := make([]byte, 4)

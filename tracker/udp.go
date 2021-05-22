@@ -1,4 +1,4 @@
-package main
+package tracker
 
 import (
 	"encoding/binary"
@@ -10,27 +10,39 @@ import (
 	"time"
 )
 
-type MessageAction uint32
+func getPeersFromUDPTracker(u *url.URL, infoHash, peerID [20]byte, port int) ([]net.TCPAddr, error) {
+	udpClient, err := NewUDPClient(u, infoHash, peerID, port)
+	if err != nil {
+		return nil, err
+	}
+	return udpClient.GetPeers()
+}
+
+// udpMessageAction is sent in Big Endian (network-byte order) on messages to
+// and from a UDP Tracker.
+type udpMessageAction uint32
 
 const (
-	ConnectAction MessageAction = iota
+	ConnectAction udpMessageAction = iota
 	AnnounceAction
 	ScrapeAction
 	ErrorAction
 )
 
-var actionStrings = map[MessageAction]string{
+var actionStrings = map[udpMessageAction]string{
 	ConnectAction:  "connect",
 	AnnounceAction: "announce",
 	ScrapeAction:   "scrape",
 	ErrorAction:    "error",
 }
 
-func (m MessageAction) String() string {
+func (m udpMessageAction) String() string {
 	return actionStrings[m]
 }
 
-type UDPTrackerClient struct {
+// UDPClient is an implementation of BEP0015 to locate peers without DHT.
+// http://bittorrent.org/beps/bep_0015.html
+type UDPClient struct {
 	conn         net.Conn
 	peerID       [20]byte
 	infoHash     [20]byte
@@ -39,17 +51,14 @@ type UDPTrackerClient struct {
 	connectionID uint64
 }
 
-// NewUDPTrackerClient can acquire Peer IP addressed (and ports) from a UDP
-// Tracker Server. It is used with magnet links to locate peers without DHT.
-//
-// BEP0015 spec: http://bittorrent.org/beps/bep_0015.html
-func NewUDPTrackerClient(trURL *url.URL, infoHash, peerID [20]byte, port int) (*UDPTrackerClient, error) {
+// NewUDPClient generates a client to a UDP Tracker server per BEP0015.
+func NewUDPClient(trURL *url.URL, infoHash, peerID [20]byte, port int) (*UDPClient, error) {
 	conn, err := net.DialTimeout("udp", trURL.Host, time.Second*5)
 	if err != nil {
 		return nil, fmt.Errorf("dialing %s: %w", trURL.String(), err)
 	}
 
-	return &UDPTrackerClient{
+	return &UDPClient{
 		conn:     conn,
 		peerID:   peerID,
 		infoHash: infoHash,
@@ -58,7 +67,7 @@ func NewUDPTrackerClient(trURL *url.URL, infoHash, peerID [20]byte, port int) (*
 }
 
 // GetPeers connects and announces to the UDP tracker, then returns the peer addresses
-func (u *UDPTrackerClient) GetPeers() ([]net.TCPAddr, error) {
+func (u *UDPClient) GetPeers() ([]net.TCPAddr, error) {
 	err := u.connect()
 	if err != nil {
 		return nil, err
@@ -72,7 +81,7 @@ func (u *UDPTrackerClient) GetPeers() ([]net.TCPAddr, error) {
 
 // Connect is the first message sent to a UDP Tracker Server to acquire a
 // Connection ID to use for future requests (namely Announce)
-func (u *UDPTrackerClient) connect() error {
+func (u *UDPClient) connect() error {
 	const protocolID = 0x41727101980 // magic constant
 	transactionID := rand.Uint32()
 
@@ -106,7 +115,7 @@ func (u *UDPTrackerClient) connect() error {
 	return nil
 }
 
-func (u *UDPTrackerClient) announce() error {
+func (u *UDPClient) announce() error {
 	announceMsg := make([]byte, 98)
 
 	binary.BigEndian.PutUint64(announceMsg[0:8], u.connectionID)
@@ -181,7 +190,7 @@ func (u *UDPTrackerClient) announce() error {
 // Currently scrape is unused because a bittorrent client doesn't need to get
 // any additional stats once it gets peer addresses from the Announce message.
 //lint:ignore U1000 unused but included for completion
-func (u *UDPTrackerClient) scrape() error {
+func (u *UDPClient) scrape() error {
 	transactionID := rand.Uint32()
 	scrapeMsg := make([]byte, 36)
 
@@ -224,7 +233,7 @@ func (u *UDPTrackerClient) scrape() error {
 //
 // If there is no error it returns the rest of the response (index 8 to the end)
 // for the caller to handle.
-func (u *UDPTrackerClient) parseUDPResponse(wantTransactionID uint32, wantAction MessageAction, resp []byte) ([]byte, error) {
+func (u *UDPClient) parseUDPResponse(wantTransactionID uint32, wantAction udpMessageAction, resp []byte) ([]byte, error) {
 	if len(resp) < 8 {
 		return nil, fmt.Errorf("response is <8 characters, got %d", len(resp))
 	}
@@ -235,13 +244,13 @@ func (u *UDPTrackerClient) parseUDPResponse(wantTransactionID uint32, wantAction
 	}
 
 	action := binary.BigEndian.Uint32(resp[0:4])
-	if MessageAction(action) == ErrorAction {
+	if udpMessageAction(action) == ErrorAction {
 		// return an error that includes the message
 		errorText := string(resp[8:])
 		return nil, fmt.Errorf("error response: %s", errorText)
 	}
-	if MessageAction(action) != wantAction {
-		return nil, fmt.Errorf("want %s action, got %s", wantAction, MessageAction(action))
+	if udpMessageAction(action) != wantAction {
+		return nil, fmt.Errorf("want %s action, got %s", wantAction, udpMessageAction(action))
 	}
 
 	return resp[8:], nil

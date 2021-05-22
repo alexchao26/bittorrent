@@ -1,4 +1,4 @@
-package main
+package tracker
 
 import (
 	"context"
@@ -14,9 +14,9 @@ import (
 	"github.com/zeebo/bencode"
 )
 
-// GetPeersFromTracker will attempt to get peers from a http/s or udp tracker
+// GetPeers will attempt to get peers from a http/s or udp tracker
 // server for the given infohash.
-func GetPeersFromTracker(trackerURL string, infoHash, peerID [20]byte, port int) ([]net.TCPAddr, error) {
+func GetPeers(trackerURL string, infoHash, peerID [20]byte, port int) ([]net.TCPAddr, error) {
 	u, err := url.Parse(trackerURL)
 	if err != nil {
 		return nil, fmt.Errorf("invalid tracker URL: %w", err)
@@ -139,26 +139,4 @@ func getPeersFromHTTPTracker(u *url.URL, infoHash, peerID [20]byte, port int) ([
 	}
 
 	return addrs, nil
-}
-
-func getPeersFromUDPTracker(u *url.URL, infoHash, peerID [20]byte, port int) ([]net.TCPAddr, error) {
-	udpClient, err := NewUDPTrackerClient(u, infoHash, peerID, port)
-	if err != nil {
-		return nil, err
-	}
-	return udpClient.GetPeers()
-}
-
-// DedupeAddrs is a helper function to dedupe all the peer addresses received
-// from multiple tracker servers
-func DedupeAddrs(addrs []net.TCPAddr) []net.TCPAddr {
-	deduped := []net.TCPAddr{}
-	set := map[string]bool{}
-	for _, a := range addrs {
-		if !set[a.String()] {
-			deduped = append(deduped, a)
-			set[a.String()] = true
-		}
-	}
-	return deduped
 }

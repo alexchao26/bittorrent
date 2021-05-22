@@ -1,4 +1,4 @@
-package main
+package peer
 
 import (
 	"bytes"
@@ -21,7 +21,7 @@ type extendedHandshakeMessage struct {
 	MetadataSize int `bencode:"metadata_size"`
 }
 
-func (p *PeerClient) receiveExtendedHandshake() error {
+func (p *Client) receiveExtendedHandshake() error {
 	// <length, uint32><message_id (20), uint8><extended_msg_id, uint8><msg []byte>
 	msg, err := p.receiveMessage()
 	if err != nil {
@@ -77,7 +77,11 @@ type metadataMessage struct {
 	TotalSize int                 `bencode:"total_size,omitempty"`
 }
 
-func (p *PeerClient) GetMetadata(infoHash [20]byte) ([]byte, error) {
+// GetMetadata requests and receives the raw metadata/info dictionary from the
+// peer (per BEP0009). If the peer does not support this extension, a non-nil
+// error is returned.
+// http://bittorrent.org/beps/bep_0009.html
+func (p *Client) GetMetadata(infoHash [20]byte) ([]byte, error) {
 	if p.metadataExtension.messageID == 0 || p.metadataExtension.metadataSize == 0 {
 		return nil, fmt.Errorf("client does not support metadata extension")
 	}
