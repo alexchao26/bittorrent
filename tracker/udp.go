@@ -3,7 +3,6 @@ package tracker
 import (
 	"encoding/binary"
 	"fmt"
-	"io"
 	"math/rand"
 	"net"
 	"net/url"
@@ -43,7 +42,7 @@ func (m udpMessageAction) String() string {
 // UDPClient is an implementation of BEP0015 to locate peers without DHT.
 // http://bittorrent.org/beps/bep_0015.html
 type UDPClient struct {
-	conn         net.Conn
+	conn         *net.UDPConn
 	peerID       [20]byte
 	infoHash     [20]byte
 	port         int
@@ -53,13 +52,23 @@ type UDPClient struct {
 
 // NewUDPClient generates a client to a UDP Tracker server per BEP0015.
 func NewUDPClient(trURL *url.URL, infoHash, peerID [20]byte, port int) (*UDPClient, error) {
-	conn, err := net.DialTimeout("udp", trURL.Host, time.Second*5)
+	// conn, err := net.DialTimeout(trURL.Scheme, trURL.Host, time.Second*5) // todo(alex) set timeout?
+	udpAddr, err := net.ResolveUDPAddr(trURL.Scheme, trURL.Host)
 	if err != nil {
-		return nil, fmt.Errorf("dialing %s: %w", trURL.String(), err)
+		return nil, fmt.Errorf("resolving udp addr: %w", err)
+	}
+	udpConn, err := net.DialUDP("udp", nil, udpAddr)
+	if err != nil {
+		return nil, fmt.Errorf("dialing: %w", err)
+	}
+
+	err = udpConn.SetReadBuffer(4096)
+	if err != nil {
+		return nil, fmt.Errorf("setting udp conn read buffer: %w", err)
 	}
 
 	return &UDPClient{
-		conn:     conn,
+		conn:     udpConn,
 		peerID:   peerID,
 		infoHash: infoHash,
 		port:     port,
@@ -100,9 +109,12 @@ func (u *UDPClient) connect() error {
 
 	// Read connect response from server
 	resp := make([]byte, 16)
-	_, err = io.ReadFull(u.conn, resp)
+	n, _, _, _, err := u.conn.ReadMsgUDP(resp, nil)
 	if err != nil {
 		return fmt.Errorf("reading connect resp: %w", err)
+	}
+	if n != 16 {
+		return fmt.Errorf("want connect message to be 16 bytes, got %d", n)
 	}
 	connectResp, err := u.parseUDPResponse(transactionID, ConnectAction, resp)
 	if err != nil {
